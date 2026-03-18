@@ -1,0 +1,98 @@
+#!/bin/zsh
+# Copy a log file from HPC cluster to local project directory
+# Usage:
+#   lcplog bp 12345        - Copy job 12345 log from BluePebble
+#   lcplog mn 12345        - Copy job 12345 log from MareNostrum
+#   lcplog bp              - Copy most recent log from BluePebble
+#   lcplog -p aas bp 12345 - Copy log from aas project
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Parse -p flag first
+PROJECT_ALIAS=""
+if [[ "$1" == "-p" || "$1" == "--project" ]]; then
+    PROJECT_ALIAS=$2
+    shift 2
+fi
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    echo "Usage: lcplog [-p project] <cluster> [job_id]"
+    echo "  -p, --project  Select project alias (see ~/.hpc_projects)"
+    echo "  cluster: bp, mn, or is"
+    echo "  job_id:  optional - copies most recent if omitted"
+    exit 0
+fi
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: lcplog [-p project] <cluster> [job_id]"
+    echo "  -p, --project  Select project alias (see ~/.hpc_projects)"
+    echo "  cluster: bp, mn, or is"
+    echo "  job_id:  optional - copies most recent if omitted"
+    exit 1
+fi
+
+# Load project config
+source "$(dirname "$0")/../lib/_hpc_project_config"
+resolve_project "$PROJECT_ALIAS"
+
+CLUSTER=$1
+JOB_ID=$2
+
+# Ensure local logs directory exists
+mkdir -p "$LOCAL_LOGS"
+
+if [[ -n "$JOB_ID" ]]; then
+    # Copy specific job log
+    if [[ "$CLUSTER" == "mn" ]]; then
+        REMOTE_PATH="~/$WORK_DIR/slurm-${JOB_ID}.out"
+        LOCAL_NAME="${CLUSTER}_slurm-${JOB_ID}.out"
+    else
+        REMOTE_PATH="~/$WORK_DIR/logs/qf_${JOB_ID}.out"
+        LOCAL_NAME="${CLUSTER}_qf_${JOB_ID}.out"
+    fi
+
+    echo "${BLUE}Copying $REMOTE_PATH from $CLUSTER...${NC}"
+    scp "$CLUSTER:$REMOTE_PATH" "$LOCAL_LOGS/$LOCAL_NAME" 2>/dev/null
+
+    if [[ $? -eq 0 ]]; then
+        echo "${GREEN}Saved to: $LOCAL_LOGS/$LOCAL_NAME${NC}"
+    else
+        echo "${RED}Failed to copy log${NC}"
+        exit 1
+    fi
+else
+    # Copy most recent log
+    echo "${BLUE}Finding most recent log on $CLUSTER...${NC}"
+
+    REMOTE_PATH=$(ssh "$CLUSTER" "
+        cd ~/$WORK_DIR 2>/dev/null || exit 1
+        if [[ -d logs ]]; then
+            ls -t logs/qf_*.out 2>/dev/null | head -1
+        else
+            ls -t slurm-*.out 2>/dev/null | head -1
+        fi
+    " 2>/dev/null)
+
+    if [[ -z "$REMOTE_PATH" ]]; then
+        echo "${RED}No logs found on $CLUSTER${NC}"
+        exit 1
+    fi
+
+    LOCAL_NAME="${CLUSTER}_$(basename $REMOTE_PATH)"
+
+    echo "${BLUE}Copying $REMOTE_PATH...${NC}"
+    scp "$CLUSTER:~/$WORK_DIR/$REMOTE_PATH" "$LOCAL_LOGS/$LOCAL_NAME" 2>/dev/null
+
+    if [[ $? -eq 0 ]]; then
+        echo "${GREEN}Saved to: $LOCAL_LOGS/$LOCAL_NAME${NC}"
+    else
+        echo "${RED}Failed to copy log${NC}"
+        exit 1
+    fi
+fi

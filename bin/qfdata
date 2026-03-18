@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""CLI for analyzing qualitative feedback DPO pair data (JSONL files)."""
+
+import json
+import re
+import sys
+import random
+import argparse
+from pathlib import Path
+from collections import Counter
+
+
+def load_pairs(path):
+    with open(path) as f:
+        return [json.loads(line) for line in f]
+
+
+def extract_boxed(text):
+    """Extract the last \\boxed{...} answer from a solution."""
+    if not text:
+        return None
+    matches = re.findall(r'\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}', text)
+    return matches[-1].strip() if matches else None
+
+
+def extract_any_answer(text):
+    """Try to extract a final answer from text, even without \\boxed."""
+    boxed = extract_boxed(text)
+    if boxed:
+        return boxed
+    # Look for "Final Answer: ..." patterns
+    m = re.search(r'(?:final answer|answer is)[:\s]*\$*([^\n$]+)', text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().rstrip('.')
+    return None
+
+
+def has_meta_commentary(text):
+    """Check if text contains self-referential 'this is wrong' language."""
+    patterns = [
+        r'\b[Ii]ncorrect\b', r'\b[Ww]rong\b', r'\b[Ff]lawed\b',
+        r'\b[Mm]istake\b', r'\b[Ee]rroneous\b', r'\b[Ii]nvalid\b',
+        r'subtly.*incorrect', r'leads to.*wrong', r'incorrect.*conclusion',
+        r'Final.*Incorrect', r'not.*correct',
+    ]
+    return any(re.search(p, text) for p in patterns)
+
+
+def detect_data_type(examples):
+    """Detect if data is DPO pairs or distillation examples."""
+    if not examples:
+        return "unknown"
+    ex0 = examples[0]
+    if "target_solution" in ex0:
+        return "distillation"
+    if "chosen" in ex0 and "rejected" in ex0:
+        return "dpo"
+    return "unknown"
+
+
+def cmd_summary(args):
+    """Print summary statistics for a JSONL file."""
+    pairs = load_pairs(args.file)
+    n = len(pairs)
+    dtype = detect_data_type(pairs)
+    print(f"File: {args.file}")
+    print(f"Total examples: {n}")
+    print(f"Data type: {dtype}")
+    print(f"Fields: {list(pairs[0].keys())}")
+    print()
+
+    if dtype == "distillation":
+        _summary_distillation(pairs)
+    else:
+        _summary_dpo(pairs)
+
+
+def _summary_distillation(examples):
+    """Summary stats for distillation examples."""
+    n = len(examples)
+
+    # Length stats for key fields
+    for field in ["feedback", "new_problem", "target_solution", "target_solution_cot"]:
+        lens = [len(e.get(field, "")) for e in examples]
+        if any(lens):
+            print(f"  {field} lengths: min={min(lens)}, max={max(lens)}, "
+                  f"mean={sum(lens)/len(lens):.0f}, median={sorted(lens)[len(lens)//2]}")
+
+    # Unique counts
+    unique_src = len(set(e["question"] for e in examples))
+    unique_new = len(set(e["new_problem"] for e in examples))
+    print(f"\n  Unique source questions: {unique_src}")
+    print(f"  Unique new problems: {unique_new}")
+    print(f"  Expansion ratio: {n / max(unique_src, 1):.1f}x")
+
+    # Context type distribution
+    ctx_types = Counter(e.get("privileged_context_type", "unknown") for e in examples)
+    print(f"  Privileged context types: {dict(ctx_types)}")
+
+    # Answer extraction from target solutions
+    has_boxed = sum(1 for e in examples if extract_boxed(e.get("target_solution", "")))
+    print(f"\n  Target solutions with \\boxed answer: {has_boxed}/{n} ({has_boxed/n:.1%})")
+
+    # Check if target solutions look "confused" (contain self-contradiction markers)
+    confused_markers = [
+        r"[Ww]ait,?\s+(but|that|this|let me)",
+        r"[Hh]mm,?\s",
+        r"[Cc]ontradiction",
+        r"[Tt]his (doesn.t|can.t|isn.t) (make sense|work|right|correct)",
+        r"[Ll]et me (re-?read|start over|try again|reconsider)",
+        r"[Ss]omething.s (wrong|off|not right)",
+        r"[Ii](.m|'m) (confused|stuck|going in circles)",
+    ]
+    confused_pattern = re.compile("|".join(confused_markers))
+    confused_count = sum(1 for e in examples
+                        if confused_pattern.search(e.get("target_solution", "")))
+    print(f"  Target solutions with confusion markers: {confused_count}/{n} ({confused_count/n:.1%})")
+
+    # Check feedback quality
+    fb_lens = [len(e.get("feedback", "")) for e in examples]
+    null_fb = sum(1 for e in examples if e.get("feedback_is_null", False))
+    print(f"\n  Null feedbacks (should be 0): {null_fb}")
+    print(f"  Avg feedback length: {sum(fb_lens)/n:.0f} chars")
+
+
+def _summary_dpo(pairs):
+    """Summary stats for DPO pair data."""
+    n = len(pairs)
+
+    chosen_has_answer = sum(1 for p in pairs if extract_boxed(p.get('chosen', '')))
+    rejected_has_answer = sum(1 for p in pairs if extract_boxed(p.get('rejected', '')))
+
+    # Divergence
+    divergent = 0
+    same_answer = 0
+    for p in pairs:
+        ca = extract_boxed(p.get('chosen', ''))
+        ra = extract_boxed(p.get('rejected', ''))
+        if ca and ra:
+            if ca == ra:
+                same_answer += 1
+            else:
+                divergent += 1
+
+    # Correctness
+    chosen_correct = 0
+    rejected_correct = 0
+    rejected_more_correct = 0  # rejected matches ground truth but chosen doesn't
+    for p in pairs:
+        gt = p.get('correct_solution', '')
+        ca = extract_boxed(p.get('chosen', ''))
+        ra = extract_boxed(p.get('rejected', ''))
+        c_match = ca and (ca == gt or ca.strip() == gt.strip())
+        r_match = ra and (ra == gt or ra.strip() == gt.strip())
+        if c_match:
+            chosen_correct += 1
+        if r_match:
+            rejected_correct += 1
+        if r_match and not c_match:
+            rejected_more_correct += 1
+
+    # Meta-commentary
+    rejected_meta = sum(1 for p in pairs if has_meta_commentary(p.get('rejected', '')))
+    chosen_meta = sum(1 for p in pairs if has_meta_commentary(p.get('chosen', '')))
+
+    print(f"Chosen answer rate:    {chosen_has_answer}/{n} ({chosen_has_answer/n:.1%})")
+    print(f"Rejected answer rate:  {rejected_has_answer}/{n} ({rejected_has_answer/n:.1%})")
+    print(f"Divergent pairs:       {divergent}/{n} ({divergent/n:.1%})")
+    print(f"Same-answer pairs:     {same_answer}/{n} ({same_answer/n:.1%})")
+    print()
+    print(f"Chosen correct:        {chosen_correct}/{n} ({chosen_correct/n:.1%})")
+    print(f"Rejected correct:      {rejected_correct}/{n} ({rejected_correct/n:.1%})")
+    print(f"SWAPPED (rej correct, chosen wrong): {rejected_more_correct}/{n} ({rejected_more_correct/n:.1%})")
+    print()
+    print(f"Rejected has meta-commentary ('incorrect/wrong/flawed/...'):  {rejected_meta}/{n} ({rejected_meta/n:.1%})")
+    print(f"Chosen has meta-commentary:   {chosen_meta}/{n} ({chosen_meta/n:.1%})")
+
+    # Length stats
+    chosen_lens = [len(p.get('chosen', '')) for p in pairs]
+    rejected_lens = [len(p.get('rejected', '')) for p in pairs]
+    print()
+    print(f"Avg chosen length:     {sum(chosen_lens)/n:.0f} chars")
+    print(f"Avg rejected length:   {sum(rejected_lens)/n:.0f} chars")
+
+
+def cmd_sample(args):
+    """Show N sample examples from a JSONL file."""
+    pairs = load_pairs(args.file)
+    dtype = detect_data_type(pairs)
+    n = args.n or 3
+    random.seed(args.seed)
+    samples = random.sample(pairs, min(n, len(pairs)))
+
+    if dtype == "distillation":
+        _sample_distillation(samples, args)
+    else:
+        _sample_dpo(samples, args)
+
+
+def _sample_distillation(samples, args):
+    """Show sample distillation examples."""
+    for i, ex in enumerate(samples):
+        print(f"{'='*80}")
+        print(f"EXAMPLE {i+1}")
+        print(f"{'='*80}")
+
+        # Source question + feedback
+        print(f"Source question (first 300 chars):")
+        print(f"  {ex.get('question', 'N/A')[:300]}")
+        print(f"\nFeedback:")
+        print(f"  {ex.get('feedback', 'N/A')[:500]}")
+
+        # Generated problem
+        print(f"\nNew problem:")
+        print(f"  {ex.get('new_problem', 'N/A')[:500]}")
+
+        # Target solution summary
+        target = ex.get('target_solution', '')
+        answer = extract_boxed(target) or extract_any_answer(target) or '[no answer found]'
+        print(f"\nTarget solution answer: {answer[:200]}")
+        print(f"Target solution length: {len(target)} chars")
+
+        # Flags
+        flags = []
+        confused_markers = [
+            r"[Ww]ait,?\s+(but|that|this|let me)",
+            r"[Cc]ontradiction",
+            r"[Ll]et me (re-?read|start over|try again|reconsider)",
+            r"[Ii](.m|'m) (confused|stuck|going in circles)",
+        ]
+        if any(re.search(m, target) for m in confused_markers):
+            flags.append("CONFUSED_SOLUTION")
+        if len(target) > 10000:
+            flags.append(f"VERY_LONG ({len(target)} chars)")
+        if not extract_boxed(target):
+            flags.append("NO_BOXED_ANSWER")
+        if flags:
+            print(f"  FLAGS: {', '.join(flags)}")
+
+        if args.verbose:
+            tail = args.tail or 500
+            print(f"\n--- Target solution (last {tail} chars) ---")
+            print(target[-tail:])
+
+        print()
+
+
+def _sample_dpo(samples, args):
+    """Show sample DPO pairs."""
+    for i, pair in enumerate(samples):
+        gt = pair.get('correct_solution', 'N/A')
+        ca = extract_boxed(pair.get('chosen', '')) or '[no boxed answer]'
+        ra = extract_boxed(pair.get('rejected', '')) or '[no boxed answer]'
+
+        print(f"{'='*80}")
+        print(f"PAIR {i+1}")
+        print(f"{'='*80}")
+        print(f"Question (first 300 chars):")
+        print(f"  {pair.get('question', 'N/A')[:300]}")
+        print(f"\nGround truth: {gt[:200]}")
+        print(f"Chosen answer: {ca[:200]}")
+        print(f"Rejected answer: {ra[:200]}")
+
+        # Flag issues
+        flags = []
+        if ca == ra:
+            flags.append("SAME_ANSWER")
+        if ra.strip() == gt.strip() and ca.strip() != gt.strip():
+            flags.append("SWAPPED (rejected is correct!)")
+        if has_meta_commentary(pair.get('rejected', '')):
+            flags.append("REJECTED_HAS_META")
+        if ca.strip() != gt.strip():
+            flags.append("CHOSEN_WRONG")
+        if flags:
+            print(f"  FLAGS: {', '.join(flags)}")
+
+        if args.verbose:
+            tail = args.tail or 500
+            print(f"\n--- Chosen (last {tail} chars) ---")
+            print(pair.get('chosen', '')[-tail:])
+            print(f"\n--- Rejected (last {tail} chars) ---")
+            print(pair.get('rejected', '')[-tail:])
+            if pair.get('feedback'):
+                print(f"\n--- Feedback (first 500 chars) ---")
+                print(pair.get('feedback', '')[:500])
+
+        print()
+
+
+def cmd_compare(args):
+    """Compare two JSONL files side by side."""
+    pairs1 = load_pairs(args.file1)
+    pairs2 = load_pairs(args.file2)
+
+    def stats(pairs, label):
+        n = len(pairs)
+        chosen_correct = sum(1 for p in pairs if extract_boxed(p.get('chosen', '')) and
+                           extract_boxed(p.get('chosen', '')).strip() == p.get('correct_solution', '').strip())
+        rejected_correct = sum(1 for p in pairs if extract_boxed(p.get('rejected', '')) and
+                              extract_boxed(p.get('rejected', '')).strip() == p.get('correct_solution', '').strip())
+        swapped = sum(1 for p in pairs if
+                     extract_boxed(p.get('rejected', '')) and
+                     extract_boxed(p.get('rejected', '')).strip() == p.get('correct_solution', '').strip() and
+                     (not extract_boxed(p.get('chosen', '')) or
+                      extract_boxed(p.get('chosen', '')).strip() != p.get('correct_solution', '').strip()))
+        divergent = sum(1 for p in pairs if
+                       extract_boxed(p.get('chosen', '')) and extract_boxed(p.get('rejected', '')) and
+                       extract_boxed(p.get('chosen', '')) != extract_boxed(p.get('rejected', '')))
+        meta = sum(1 for p in pairs if has_meta_commentary(p.get('rejected', '')))
+        chosen_ans = sum(1 for p in pairs if extract_boxed(p.get('chosen', '')))
+        rejected_ans = sum(1 for p in pairs if extract_boxed(p.get('rejected', '')))
+        return {
+            'label': label, 'n': n,
+            'chosen_ans': f"{chosen_ans/n:.1%}",
+            'rejected_ans': f"{rejected_ans/n:.1%}",
+            'divergent': f"{divergent/n:.1%}",
+            'chosen_correct': f"{chosen_correct/n:.1%}",
+            'rejected_correct': f"{rejected_correct/n:.1%}",
+            'swapped': f"{swapped/n:.1%}",
+            'meta': f"{meta/n:.1%}",
+        }
+
+    s1 = stats(pairs1, Path(args.file1).name)
+    s2 = stats(pairs2, Path(args.file2).name)
+
+    headers = ['Metric', s1['label'], s2['label']]
+    rows = [
+        ['N pairs', s1['n'], s2['n']],
+        ['Chosen answer rate', s1['chosen_ans'], s2['chosen_ans']],
+        ['Rejected answer rate', s1['rejected_ans'], s2['rejected_ans']],
+        ['Divergent', s1['divergent'], s2['divergent']],
+        ['Chosen correct', s1['chosen_correct'], s2['chosen_correct']],
+        ['Rejected correct', s1['rejected_correct'], s2['rejected_correct']],
+        ['SWAPPED (rej correct, cho wrong)', s1['swapped'], s2['swapped']],
+        ['Rejected meta-commentary', s1['meta'], s2['meta']],
+    ]
+
+    # Print table
+    col_widths = [max(len(str(r[i])) for r in [headers] + rows) for i in range(3)]
+    fmt = f"  {{:<{col_widths[0]}}}  {{:>{col_widths[1]}}}  {{:>{col_widths[2]}}}"
+    print(fmt.format(*headers))
+    print(fmt.format(*['-' * w for w in col_widths]))
+    for row in rows:
+        print(fmt.format(*[str(x) for x in row]))
+
+
+def cmd_full(args):
+    """Show the full transcript for a specific pair (by index) or random pairs."""
+    pairs = load_pairs(args.file)
+
+    if args.index is not None:
+        indices = [args.index]
+    else:
+        random.seed(args.seed)
+        indices = sorted(random.sample(range(len(pairs)), min(args.n, len(pairs))))
+
+    # Ordered fields for readable output (pipeline order)
+    field_order = [
+        ('question', 'ORIGINAL PROBLEM'),
+        ('correct_solution', 'GROUND TRUTH ANSWER'),
+        ('solution', 'STUDENT SOLUTION (original attempt)'),
+        ('is_correct', 'WAS STUDENT CORRECT?'),
+        ('feedback_cot', 'TEACHER FEEDBACK (chain of thought)'),
+        ('feedback', 'TEACHER FEEDBACK (final)'),
+        ('feedback_is_null', 'FEEDBACK IS NULL?'),
+        ('chosen_cot', 'CHOSEN (chain of thought)'),
+        ('chosen', 'CHOSEN SOLUTION'),
+        ('rejected_cot', 'REJECTED (chain of thought)'),
+        ('rejected', 'REJECTED SOLUTION'),
+    ]
+
+    for idx in indices:
+        pair = pairs[idx]
+        gt = pair.get('correct_solution', 'N/A')
+        ca = extract_boxed(pair.get('chosen', '')) or '[no boxed]'
+        ra = extract_boxed(pair.get('rejected', '')) or '[no boxed]'
+
+        print(f"{'='*80}")
+        print(f"PAIR {idx} (epoch {pair.get('epoch', '?')})")
+        print(f"{'='*80}")
+
+        # Quick summary header
+        flags = []
+        if ca == ra:
+            flags.append("SAME_ANSWER")
+        if ra.strip() == gt.strip() and ca.strip() != gt.strip():
+            flags.append("SWAPPED")
+        if has_meta_commentary(pair.get('rejected', '')):
+            flags.append("REJECTED_HAS_META")
+        if ca.strip() != gt.strip():
+            flags.append("CHOSEN_WRONG")
+        print(f"  GT: {gt[:150]}  |  Chosen: {ca[:150]}  |  Rejected: {ra[:150]}")
+        if flags:
+            print(f"  FLAGS: {', '.join(flags)}")
+        print()
+
+        # Full transcript
+        for field_key, field_label in field_order:
+            val = pair.get(field_key)
+            if val is None:
+                continue
+            print(f"--- {field_label} ---")
+            if isinstance(val, bool):
+                print(f"  {val}")
+            elif isinstance(val, str):
+                # Truncate if needed
+                if args.max_len and len(val) > args.max_len:
+                    print(val[:args.max_len])
+                    print(f"\n  [...truncated, {len(val)} chars total, use --max-len 0 for full...]")
+                else:
+                    print(val)
+            else:
+                print(f"  {val}")
+            print()
+
+        # Also dump any fields not in the ordered list
+        shown = {k for k, _ in field_order} | {'epoch', 'timestamp'}
+        extra = {k: v for k, v in pair.items() if k not in shown}
+        if extra:
+            print("--- OTHER FIELDS ---")
+            for k, v in extra.items():
+                print(f"  {k}: {str(v)[:200]}")
+            print()
+
+        print()
+
+
+def cmd_grep(args):
+    """Search within a specific field of pairs."""
+    pairs = load_pairs(args.file)
+    field = args.field or 'rejected'
+    pattern = re.compile(args.pattern, re.IGNORECASE if args.ignore_case else 0)
+    matches = []
+    for i, p in enumerate(pairs):
+        text = p.get(field, '')
+        if pattern.search(text):
+            matches.append((i, p))
+
+    print(f"Matches: {len(matches)}/{len(pairs)} pairs have '{args.pattern}' in '{field}'")
+    if args.show and matches:
+        n = min(args.show, len(matches))
+        print(f"\nShowing first {n} matches:")
+        for idx, (i, p) in enumerate(matches[:n]):
+            gt = p.get('correct_solution', 'N/A')
+            ca = extract_boxed(p.get('chosen', '')) or '[none]'
+            ra = extract_boxed(p.get('rejected', '')) or '[none]'
+            print(f"\n  Pair {i}: GT={gt[:80]} | Chosen={ca[:80]} | Rejected={ra[:80]}")
+            # Show context around match
+            text = p.get(field, '')
+            m = pattern.search(text)
+            if m:
+                start = max(0, m.start() - 100)
+                end = min(len(text), m.end() + 100)
+                print(f"  Context: ...{text[start:end]}...")
+
+
+def cmd_distill_quality(args):
+    """Deep quality analysis for distillation data."""
+    examples = load_pairs(args.file)
+    n = len(examples)
+
+    print(f"=== Distillation Quality Analysis ===")
+    print(f"File: {args.file}")
+    print(f"Total examples: {n}\n")
+
+    # 1. New problem = source question (exact or near-duplicate)
+    from difflib import SequenceMatcher
+    exact_copies = 0
+    near_copies = 0
+    for ex in examples:
+        q = ex.get('question', '').strip()
+        np_ = ex.get('new_problem', '').strip()
+        if q == np_:
+            exact_copies += 1
+        elif SequenceMatcher(None, q[:500], np_[:500]).ratio() > 0.8:
+            near_copies += 1
+
+    print(f"New problem = exact copy of source: {exact_copies}/{n} ({exact_copies/n:.1%})")
+    print(f"New problem ~ near-copy of source (>80% similar): {near_copies}/{n} ({near_copies/n:.1%})")
+    print(f"Genuinely new problems: {n - exact_copies - near_copies}/{n} ({(n - exact_copies - near_copies)/n:.1%})")
+
+    # 2. Target solution quality buckets
+    good = 0  # has boxed answer, not confused, reasonable length
+    confused_with_answer = 0  # confused but reached an answer
+    confused_no_answer = 0  # confused and no answer
+    short_clean = 0  # short, clean, has answer
+    confused_markers = [
+        r"[Ww]ait,?\s+(but|that|this|let me)",
+        r"[Cc]ontradiction",
+        r"[Ll]et me (re-?read|start over|try again|reconsider)",
+        r"[Ii](.m|'m) (confused|stuck|going in circles)",
+    ]
+    confused_pattern = re.compile("|".join(confused_markers))
+
+    for ex in examples:
+        sol = ex.get('target_solution', '')
+        has_box = bool(extract_boxed(sol))
+        is_confused = bool(confused_pattern.search(sol))
+        is_long = len(sol) > 10000
+
+        if has_box and not is_confused:
+            if len(sol) < 5000:
+                short_clean += 1
+            else:
+                good += 1
+        elif has_box and is_confused:
+            confused_with_answer += 1
+        else:
+            confused_no_answer += 1
+
+    print(f"\n--- Target Solution Quality ---")
+    print(f"  Clean & short (<5K, boxed, not confused): {short_clean}/{n} ({short_clean/n:.1%})")
+    print(f"  Clean & long (boxed, not confused): {good}/{n} ({good/n:.1%})")
+    print(f"  Confused but has answer: {confused_with_answer}/{n} ({confused_with_answer/n:.1%})")
+    print(f"  Confused, no answer: {confused_no_answer}/{n} ({confused_no_answer/n:.1%})")
+
+    # 3. Solution length distribution
+    sol_lens = sorted([len(ex.get('target_solution', '')) for ex in examples])
+    print(f"\n--- Solution Length Percentiles ---")
+    for p in [10, 25, 50, 75, 90, 95, 99]:
+        idx = int(n * p / 100)
+        print(f"  p{p}: {sol_lens[min(idx, n-1)]:,} chars")
+
+    # 4. Feedback-problem alignment: check if key terms from feedback appear in new_problem
+    aligned = 0
+    for ex in examples:
+        fb = ex.get('feedback', '').lower()
+        np_ = ex.get('new_problem', '').lower()
+        # Extract key math terms from feedback
+        math_terms = set(re.findall(r'\b(triangle|circle|angle|integral|derivative|probability|combinat|permut|modular|sequence|series|polynomial|matrix|vector|inequality|prime|factor|divisib|congru|binomial|geometry|algebra|calculus|trigonometr)\w*\b', fb))
+        if math_terms:
+            overlap = sum(1 for t in math_terms if t in np_)
+            if overlap > 0:
+                aligned += 1
+    print(f"\n--- Feedback-Problem Alignment ---")
+    print(f"  Feedback math terms found in new problem: {aligned}/{n} ({aligned/n:.1%})")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Analyze qualitative feedback data (DPO or distillation)')
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    # summary
+    p_sum = subparsers.add_parser('summary', aliases=['s'], help='Summary stats')
+    p_sum.add_argument('file', help='JSONL file path')
+
+    # sample
+    p_samp = subparsers.add_parser('sample', aliases=['show'], help='Show sample pairs')
+    p_samp.add_argument('file', help='JSONL file path')
+    p_samp.add_argument('-n', type=int, default=3, help='Number of samples')
+    p_samp.add_argument('--seed', type=int, default=42, help='Random seed')
+    p_samp.add_argument('-v', '--verbose', action='store_true', help='Show full solution tails')
+    p_samp.add_argument('--tail', type=int, default=500, help='Chars to show from end of solutions')
+
+    # compare
+    p_comp = subparsers.add_parser('compare', aliases=['cmp'], help='Compare two files')
+    p_comp.add_argument('file1', help='First JSONL file')
+    p_comp.add_argument('file2', help='Second JSONL file')
+
+    # full
+    p_full = subparsers.add_parser('full', aliases=['f'], help='Show full transcript for pair(s)')
+    p_full.add_argument('file', help='JSONL file path')
+    p_full.add_argument('-i', '--index', type=int, default=None, help='Specific pair index (0-based)')
+    p_full.add_argument('-n', type=int, default=1, help='Number of random pairs (if no --index)')
+    p_full.add_argument('--seed', type=int, default=42, help='Random seed')
+    p_full.add_argument('--max-len', type=int, default=3000, help='Max chars per field (0=unlimited)')
+
+    # grep
+    p_grep = subparsers.add_parser('grep', aliases=['g'], help='Search within fields')
+    p_grep.add_argument('file', help='JSONL file path')
+    p_grep.add_argument('pattern', help='Regex pattern to search')
+    p_grep.add_argument('-f', '--field', default='rejected', help='Field to search (default: rejected)')
+    p_grep.add_argument('-i', '--ignore-case', action='store_true', help='Case insensitive')
+    p_grep.add_argument('-s', '--show', type=int, default=0, help='Show N matching pairs')
+
+    # distill-quality
+    p_dq = subparsers.add_parser('distill-quality', aliases=['dq'], help='Deep quality analysis for distillation data')
+    p_dq.add_argument('file', help='JSONL file path')
+
+    args = parser.parse_args()
+
+    cmds = {
+        'summary': cmd_summary, 's': cmd_summary,
+        'sample': cmd_sample, 'show': cmd_sample,
+        'compare': cmd_compare, 'cmp': cmd_compare,
+        'full': cmd_full, 'f': cmd_full,
+        'grep': cmd_grep, 'g': cmd_grep,
+        'distill-quality': cmd_distill_quality, 'dq': cmd_distill_quality,
+    }
+    cmds[args.command](args)
+
+
+if __name__ == '__main__':
+    main()

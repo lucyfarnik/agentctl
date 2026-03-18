@@ -1,0 +1,50 @@
+#!/bin/zsh
+
+# Check job queues on HPC clusters
+# Usage: lq [cluster]
+#   lq        - all clusters
+#   lq bp     - BluePebble only
+#   lq mn     - MareNostrum only
+#   lq is     - Isambard only
+
+check_bp() {
+    ssh bp "squeue -u \$USER" 2>/dev/null
+}
+
+check_mn() {
+    ssh mn "squeue -u \$USER" 2>/dev/null
+}
+
+check_is() {
+    ssh is "squeue -u \$USER" 2>/dev/null
+}
+
+case "${1:-all}" in
+    bp|b|-b)
+        check_bp
+        ;;
+    mn|m|-m)
+        check_mn
+        ;;
+    is|i|-i)
+        check_is
+        ;;
+    all|"")
+        echo "=== BluePebble ==="
+        check_bp
+        echo ""
+        echo "=== MareNostrum ==="
+        check_mn
+        echo ""
+        echo "=== Isambard ==="
+        check_is
+        ;;
+    *)
+        echo "Usage: lq [bp|mn|is]"
+        echo "  lq      - all clusters"
+        echo "  lq bp   - BluePebble only"
+        echo "  lq mn   - MareNostrum only"
+        echo "  lq is   - Isambard only"
+        exit 1
+        ;;
+esac

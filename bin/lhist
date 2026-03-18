@@ -1,0 +1,61 @@
+#!/bin/zsh
+
+# Check job history on HPC clusters (completed/failed jobs)
+# Usage:
+#   lhist bp            - Recent job history on BluePebble
+#   lhist is            - Recent job history on Isambard
+#   lhist bp 12345      - History for specific job
+#   lhist bp -n 20      - Show last 20 jobs (default 10)
+#   lhist bp -s 7       - Jobs from last 7 days (default 3)
+
+CLUSTER=""
+JOB_ID=""
+NUM_JOBS=10
+SINCE_DAYS=3
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        bp|mn|is)
+            CLUSTER=$1
+            shift
+            ;;
+        -n|--num)
+            NUM_JOBS=$2
+            shift 2
+            ;;
+        -s|--since)
+            SINCE_DAYS=$2
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: lhist [bp|mn|is] [job_id] [-n num] [-s days]"
+            echo "  lhist bp            - Recent jobs on BluePebble"
+            echo "  lhist bp 12345      - Details for specific job"
+            echo "  lhist bp -n 20      - Last 20 jobs"
+            echo "  lhist bp -s 7       - Jobs from last 7 days"
+            exit 0
+            ;;
+        [0-9]*)
+            JOB_ID=$1
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$CLUSTER" ]]; then
+    echo "Usage: lhist [bp|mn|is] [job_id] [-n num] [-s days]"
+    exit 1
+fi
+
+FMT="JobID,JobName%20,State,ExitCode,Elapsed,Start,End,NNodes,NCPUS,AllocTRES%40"
+
+if [[ -n "$JOB_ID" ]]; then
+    ssh "$CLUSTER" "sacct -j $JOB_ID --format='$FMT'" 2>/dev/null
+else
+    START_DATE=$(date -v-${SINCE_DAYS}d +%Y-%m-%d 2>/dev/null || date -d "${SINCE_DAYS} days ago" +%Y-%m-%d 2>/dev/null)
+    ssh "$CLUSTER" "sacct --starttime=$START_DATE --format='$FMT' | head -$((NUM_JOBS * 3 + 2))" 2>/dev/null
+fi

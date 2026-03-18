@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Qualitative analysis of DPO pairs from remote HPC clusters.
+
+Usage:
+    lqa <cluster> <job_id> [--epoch N] [--show N] [--summary] [--filter same|diff|no_answer]
+    lqa <cluster> <job_id> --list          # List available epoch files
+    lqa <cluster> <job_id> --show 3        # Show 3 random pairs
+    lqa <cluster> <job_id> --summary       # Stats: answer rates, divergence, etc.
+    lqa <cluster> <job_id> --filter same   # Show pairs where chosen==rejected answer
+    lqa <cluster> <job_id> --full 0        # Show full text of pair at index 0
+
+Examples:
+    lqa bp 15865270 --list
+    lqa bp 15865270 --summary --epoch 1
+    lqa bp 15865270 --show 3 --epoch 0
+    lqa bp 15865270 --filter no_answer --epoch 0
+    lqa bp 15865270 --full 5 --epoch 0
+"""
+import argparse
+import json
+import random
+import re
+import subprocess
+import sys
+import textwrap
+
+
+def ssh_cmd(cluster, cmd, timeout=60):
+    result = subprocess.run(
+        ["ssh", cluster, cmd],
+        capture_output=True, text=True, timeout=timeout
+    )
+    return result.stdout.strip(), result.stderr.strip()
+
+
+def find_run_sub_dir(cluster, job_id):
+    """Find the run_sub_dir from the SLURM log."""
+    # Try slurm log first
+    out, _ = ssh_cmd(cluster, f"grep -o 'run_sub_dir=.*job{job_id}' ~/work/qualitative_feedback/slurm-{job_id}.out 2>/dev/null | head -1")
+    if out:
+        # Extract the value after =
+        match = re.search(r"run_sub_dir='?([^',\s]+)", out)
+        if match:
+            return match.group(1)
+    # Try listing artifacts dirs
+    out, _ = ssh_cmd(cluster, f"ls -d ~/work/qualitative_feedback/artifacts/*job{job_id}* 2>/dev/null | head -1")
+    if out:
+        return out.split("/")[-1]
+    return None
+
+
+def list_epochs(cluster, run_sub_dir):
+    out, _ = ssh_cmd(cluster, f"ls ~/work/qualitative_feedback/artifacts/{run_sub_dir}/ 2>/dev/null")
+    if out:
+        files = out.strip().split("\n")
+        for f in sorted(files):
+            print(f"  {f}")
+    else:
+        print("No artifact files found.")
+
+
+def _artifact_path(run_sub_dir, epoch):
+    return f"~/work/qualitative_feedback/artifacts/{run_sub_dir}/dpo_pairs_epoch_{epoch}.jsonl"
+
+
+def fetch_pairs(cluster, run_sub_dir, epoch):
+    path = _artifact_path(run_sub_dir, epoch)
+    try:
+        out, err = ssh_cmd(cluster, f"cat {path}", timeout=180)
+    except subprocess.TimeoutExpired:
+        print(f"Timeout fetching {path} (file too large?)")
+        sys.exit(1)
+    if not out:
+        print(f"No data found at {path}")
+        if err:
+            print(f"Error: {err}")
+        sys.exit(1)
+    pairs = []
+    for line in out.strip().split("\n"):
+        if line.strip():
+            pairs.append(json.loads(line))
+    return pairs
+
+
+def fetch_single_pair(cluster, run_sub_dir, epoch, line_num):
+    """Fetch a single pair by line number (0-indexed). Fast for large files."""
+    path = _artifact_path(run_sub_dir, epoch)
+    sed_line = line_num + 1  # sed is 1-indexed
+    out, err = ssh_cmd(cluster, f"sed -n '{sed_line}p' {path}")
+    if not out:
+        print(f"No data at line {line_num} in {path}")
+        if err:
+            print(f"Error: {err}")
+        sys.exit(1)
+    return json.loads(out)
+
+
+def fetch_pair_count(cluster, run_sub_dir, epoch):
+    """Get number of pairs without fetching the whole file."""
+    path = _artifact_path(run_sub_dir, epoch)
+    out, _ = ssh_cmd(cluster, f"wc -l < {path}")
+    return int(out.strip()) if out.strip() else 0
+
+
+def fetch_random_pairs(cluster, run_sub_dir, epoch, n, seed=42):
+    """Fetch n random pairs without downloading the whole file."""
+    total = fetch_pair_count(cluster, run_sub_dir, epoch)
+    if total == 0:
+        return [], []
+    random.seed(seed)
+    indices = sorted(random.sample(range(total), min(n, total)))
+    pairs = []
+    for idx in indices:
+        p = fetch_single_pair(cluster, run_sub_dir, epoch, idx)
+        pairs.append(p)
+    return pairs, indices
+
+
+REMOTE_SUMMARY_SCRIPT = textwrap.dedent("""\
+    import json, re, sys
+    pairs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+    n = len(pairs)
+    if n == 0:
+        print("0 pairs"); sys.exit(0)
+    def boxed(t):
+        if not t: return None
+        m = re.findall(r'\\\\boxed\\{([^{}]*(?:\\{[^{}]*\\}[^{}]*)*)\\}', t)
+        return m[-1].strip() if m else None
+    ca = [boxed(p.get('chosen','')) for p in pairs]
+    ra = [boxed(p.get('rejected','')) for p in pairs]
+    ch = sum(1 for a in ca if a)
+    rh = sum(1 for a in ra if a)
+    bh = sum(1 for c,r in zip(ca,ra) if c and r)
+    sa = sum(1 for c,r in zip(ca,ra) if c and r and c==r)
+    da = sum(1 for c,r in zip(ca,ra) if c and r and c!=r)
+    nh = sum(1 for c,r in zip(ca,ra) if not c and not r)
+    cl = [len(p.get('chosen','')) for p in pairs]
+    rl = [len(p.get('rejected','')) for p in pairs]
+    nl = [len(p.get('new_problem','')) for p in pairs]
+    nf = sum(1 for p in pairs if p.get('feedback_is_null',False))
+    co = sum(1 for p in pairs if p.get('is_correct',False))
+    mp = ["let's design","here's a","new problem:","problem statement","similar reasoning",
+          "let me create","here is a","final problem","suitable and challenging","here's the problem",
+          "let's construct","create a new","design a new","here is the"]
+    mc = sum(1 for p in pairs if any(ph in (p.get('new_problem') or '').lower() for ph in mp))
+    id_ = sum(1 for p in pairs if p.get('chosen','').strip()==p.get('rejected','').strip())
+    think_in_chosen = sum(1 for p in pairs if '<think>' in p.get('chosen',''))
+    think_in_rejected = sum(1 for p in pairs if '<think>' in p.get('rejected',''))
+    print(f"n={n}")
+    print(f"chosen_has_answer={ch}/{n} ({100*ch/n:.1f}%)")
+    print(f"rejected_has_answer={rh}/{n} ({100*rh/n:.1f}%)")
+    print(f"both_have_answer={bh}/{n} ({100*bh/n:.1f}%)")
+    print(f"same_answer={sa}/{bh} ({100*sa/bh:.1f}%)" if bh else "same_answer=0/0")
+    print(f"diff_answer={da}/{bh} ({100*da/bh:.1f}%)" if bh else "diff_answer=0/0")
+    print(f"neither_has_answer={nh}/{n} ({100*nh/n:.1f}%)")
+    print(f"chosen_len_median={sorted(cl)[n//2]} mean={sum(cl)/n:.0f}")
+    print(f"rejected_len_median={sorted(rl)[n//2]} mean={sum(rl)/n:.0f}")
+    print(f"new_problem_len_median={sorted(nl)[n//2]} mean={sum(nl)/n:.0f}")
+    print(f"feedback_null={nf}/{n} ({100*nf/n:.1f}%)")
+    print(f"original_correct={co}/{n} ({100*co/n:.1f}%)")
+    print(f"meta_commentary={mc}/{n} ({100*mc/n:.1f}%)")
+    print(f"identical_pairs={id_}/{n} ({100*id_/n:.1f}%)")
+    print(f"think_in_chosen={think_in_chosen}/{n} ({100*think_in_chosen/n:.1f}%)")
+    print(f"think_in_rejected={think_in_rejected}/{n} ({100*think_in_rejected/n:.1f}%)")
+""")
+
+
+def fetch_remote_summary(cluster, run_sub_dir, epoch):
+    """Compute summary stats server-side and return only the results."""
+    path = _artifact_path(run_sub_dir, epoch)
+    expanded_path = path.replace("~", "$HOME")
+    # Write the script to a temp file on the remote, run it, clean up
+    remote_script_path = "/tmp/lqa_summary.py"
+    # Use heredoc-style to avoid quoting hell
+    write_cmd = f"cat > {remote_script_path} << 'LQAEOF'\n{REMOTE_SUMMARY_SCRIPT}LQAEOF"
+    ssh_cmd(cluster, write_cmd, timeout=10)
+    out, err = ssh_cmd(cluster, f"python3 {remote_script_path} {expanded_path}", timeout=120)
+    if err and not out:
+        # Filter SSH warnings
+        err_lines = [l for l in err.split("\n") if "WARNING" not in l and "post-quantum" not in l and "upgraded" not in l]
+        real_err = "\n".join(err_lines).strip()
+        if real_err:
+            print(f"Remote summary error: {real_err}")
+            return None
+    return out
+
+
+def extract_answer(text):
+    """Extract the last \\boxed{...} answer from a solution."""
+    if not text:
+        return None
+    # Handle nested braces
+    matches = re.findall(r'\\boxed\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}', text)
+    return matches[-1].strip() if matches else None
+
+
+def truncate(s, n=200):
+    if not s:
+        return "(empty)"
+    s = s.strip()
+    if len(s) <= n:
+        return s
+    return s[:n] + "..."
+
+
+def show_summary(pairs):
+    n = len(pairs)
+    print(f"\n{'='*60}")
+    print(f"SUMMARY: {n} DPO pairs")
+    print(f"{'='*60}")
+
+    chosen_answers = [extract_answer(p.get("chosen", "")) for p in pairs]
+    rejected_answers = [extract_answer(p.get("rejected", "")) for p in pairs]
+
+    chosen_has_ans = sum(1 for a in chosen_answers if a is not None)
+    rejected_has_ans = sum(1 for a in rejected_answers if a is not None)
+    both_have_ans = sum(1 for c, r in zip(chosen_answers, rejected_answers) if c is not None and r is not None)
+    same_answer = sum(1 for c, r in zip(chosen_answers, rejected_answers) if c is not None and r is not None and c == r)
+    diff_answer = sum(1 for c, r in zip(chosen_answers, rejected_answers) if c is not None and r is not None and c != r)
+    neither_has = sum(1 for c, r in zip(chosen_answers, rejected_answers) if c is None and r is None)
+
+    print(f"\nAnswer extraction:")
+    print(f"  Chosen has answer:   {chosen_has_ans}/{n} ({100*chosen_has_ans/n:.1f}%)")
+    print(f"  Rejected has answer: {rejected_has_ans}/{n} ({100*rejected_has_ans/n:.1f}%)")
+    print(f"  Both have answers:   {both_have_ans}/{n} ({100*both_have_ans/n:.1f}%)")
+    print(f"  Neither has answer:  {neither_has}/{n} ({100*neither_has/n:.1f}%)")
+
+    print(f"\nDivergence (among pairs where both have answers):")
+    if both_have_ans > 0:
+        print(f"  Same answer:     {same_answer}/{both_have_ans} ({100*same_answer/both_have_ans:.1f}%)")
+        print(f"  Different answer: {diff_answer}/{both_have_ans} ({100*diff_answer/both_have_ans:.1f}%)")
+    else:
+        print("  No pairs with both answers")
+
+    # Solution lengths
+    chosen_lens = [len(p.get("chosen", "")) for p in pairs]
+    rejected_lens = [len(p.get("rejected", "")) for p in pairs]
+    new_prob_lens = [len(p.get("new_problem", "")) for p in pairs]
+
+    print(f"\nSolution lengths (chars):")
+    print(f"  Chosen:   median={sorted(chosen_lens)[n//2]:,}, mean={sum(chosen_lens)/n:,.0f}")
+    print(f"  Rejected: median={sorted(rejected_lens)[n//2]:,}, mean={sum(rejected_lens)/n:,.0f}")
+    print(f"  New prob:  median={sorted(new_prob_lens)[n//2]:,}, mean={sum(new_prob_lens)/n:,.0f}")
+
+    # Feedback null rate
+    null_feedbacks = sum(1 for p in pairs if p.get("feedback_is_null", False))
+    print(f"\nFeedback null rate: {null_feedbacks}/{n} ({100*null_feedbacks/n:.1f}%)")
+
+    # Original correctness
+    correct = sum(1 for p in pairs if p.get("is_correct", False))
+    print(f"Original solution correct: {correct}/{n} ({100*correct/n:.1f}%)")
+
+    # Meta-commentary in new problems
+    meta_phrases = [
+        "let's design", "here's a", "new problem:", "problem statement",
+        "similar reasoning", "let me create", "here is a", "final problem",
+        "suitable and challenging", "here's the problem", "let's construct",
+        "create a new", "design a new", "here is the",
+    ]
+    meta_count = 0
+    for p in pairs:
+        np_text = (p.get("new_problem") or "").lower()
+        if any(ph in np_text for ph in meta_phrases):
+            meta_count += 1
+    print(f"\nMeta-commentary in new_problem: {meta_count}/{n} ({100*meta_count/n:.1f}%)")
+
+    # Chosen/rejected that are identical or near-identical
+    identical = sum(1 for p in pairs
+                    if p.get("chosen", "").strip() == p.get("rejected", "").strip())
+    near_identical = sum(1 for p in pairs
+                         if p.get("chosen", "")[:200].strip() == p.get("rejected", "")[:200].strip()
+                         and p.get("chosen", "").strip() != p.get("rejected", "").strip())
+    print(f"Identical chosen/rejected: {identical}/{n} ({100*identical/n:.1f}%)")
+    print(f"Near-identical (same first 200 chars): {near_identical}/{n} ({100*near_identical/n:.1f}%)")
+
+
+META_PHRASES = [
+    "let's design", "here's a", "new problem:", "problem statement",
+    "similar reasoning", "let me create", "here is a", "final problem",
+    "suitable and challenging", "here's the problem", "let's construct",
+    "create a new", "design a new", "here is the",
+]
+
+
+def has_meta_commentary(pair):
+    np_text = (pair.get("new_problem") or "").lower()
+    return any(ph in np_text for ph in META_PHRASES)
+
+
+def compare_epochs(cluster, run_sub_dir):
+    """Show summary stats across all available epochs."""
+    out, _ = ssh_cmd(cluster, f"ls ~/work/qualitative_feedback/artifacts/{run_sub_dir}/ 2>/dev/null")
+    if not out:
+        print("No files found")
+        return
+
+    files = sorted(out.strip().split("\n"))
+    epochs = []
+    for f in files:
+        match = re.search(r"epoch_(\d+)", f)
+        if match:
+            epochs.append(int(match.group(1)))
+
+    header = f"{'Epoch':>5} | {'N':>5} | {'Chosen%':>8} | {'Reject%':>8} | {'Same%':>7} | {'Diff%':>7} | {'Meta%':>7} | {'Think%':>7}"
+    print(f"\n{header}")
+    print("-" * len(header))
+
+    for ep in epochs:
+        result = fetch_remote_summary(cluster, run_sub_dir, ep)
+        if not result:
+            continue
+        # Parse key=value lines
+        stats = {}
+        for line in result.split("\n"):
+            if "=" in line:
+                key = line.split("=")[0].strip()
+                # Extract the first number after =
+                val_part = line.split("=")[1].strip()
+                # Try to get the fraction (e.g. "630/630 (100.0%)")
+                m = re.match(r"(\d+)/(\d+)", val_part)
+                if m:
+                    stats[key] = (int(m.group(1)), int(m.group(2)))
+                else:
+                    try:
+                        stats[key] = int(val_part)
+                    except ValueError:
+                        stats[key] = val_part
+        n_val = stats.get("n", 0)
+        n = n_val if isinstance(n_val, int) else 0
+        def pct(key):
+            v = stats.get(key, (0, 1))
+            if isinstance(v, tuple):
+                return 100 * v[0] / v[1] if v[1] else 0
+            return 0
+        chosen_pct = pct("chosen_has_answer")
+        reject_pct = pct("rejected_has_answer")
+        same_pct = pct("same_answer")
+        diff_pct = pct("diff_answer")
+        meta_pct = pct("meta_commentary")
+        think_pct = pct("think_in_chosen")
+        print(f"{ep:>5} | {n:>5} | {chosen_pct:>7.1f}% | {reject_pct:>7.1f}% | {same_pct:>6.1f}% | {diff_pct:>6.1f}% | {meta_pct:>6.1f}% | {think_pct:>6.1f}%")
+
+
+def show_pairs(pairs, indices, full_index=None):
+    for idx in indices:
+        p = pairs[idx]
+        chosen_ans = extract_answer(p.get("chosen", ""))
+        rejected_ans = extract_answer(p.get("rejected", ""))
+        orig_ans = p.get("correct_solution", "N/A")
+
+        same = "SAME" if (chosen_ans and rejected_ans and chosen_ans == rejected_ans) else \
+               "DIFF" if (chosen_ans and rejected_ans) else "MISSING"
+
+        print(f"\n{'='*60}")
+        print(f"PAIR #{idx} | Answers: {same}")
+        print(f"{'='*60}")
+        print(f"Original question: {truncate(p.get('question', ''), 200)}")
+        print(f"Original GT answer: {truncate(str(orig_ans), 100)}")
+        print(f"Was correct: {p.get('is_correct', 'N/A')}")
+        print(f"\nNew problem: {truncate(p.get('new_problem', ''), 300)}")
+        print(f"\nChosen answer:   {chosen_ans or 'NO_ANSWER'}")
+        print(f"Rejected answer: {rejected_ans or 'NO_ANSWER'}")
+
+        if full_index is not None and idx == full_index:
+            print(f"\n--- FEEDBACK ---")
+            print(textwrap.fill(p.get("feedback", ""), 100))
+            print(f"\n--- CHOSEN (full) ---")
+            print(p.get("chosen", "")[:3000])
+            print(f"\n--- REJECTED (full) ---")
+            print(p.get("rejected", "")[:3000])
+        else:
+            print(f"\nChosen (first 300): {truncate(p.get('chosen', ''), 300)}")
+            print(f"Rejected (first 300): {truncate(p.get('rejected', ''), 300)}")
+            print(f"\nFeedback (first 200): {truncate(p.get('feedback', ''), 200)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Qualitative analysis of DPO pairs")
+    parser.add_argument("cluster", help="Cluster: bp, mn, is")
+    parser.add_argument("job_id", help="SLURM job ID")
+    parser.add_argument("--epoch", type=int, default=0, help="Epoch number (default: 0)")
+    parser.add_argument("--list", action="store_true", help="List available epoch files")
+    parser.add_argument("--summary", action="store_true", help="Show summary statistics")
+    parser.add_argument("--show", type=int, default=0, help="Show N random pairs")
+    parser.add_argument("--full", type=int, default=None, help="Show full text of pair at index")
+    parser.add_argument("--filter", choices=["same", "diff", "no_answer", "meta"], help="Filter pairs")
+    parser.add_argument("--compare-epochs", action="store_true", help="Compare summary stats across all epochs")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
+    args = parser.parse_args()
+
+    # Find run_sub_dir
+    run_sub_dir = find_run_sub_dir(args.cluster, args.job_id)
+    if not run_sub_dir:
+        print(f"Could not find run_sub_dir for job {args.job_id} on {args.cluster}")
+        sys.exit(1)
+    print(f"Run: {run_sub_dir}")
+
+    if args.list:
+        list_epochs(args.cluster, run_sub_dir)
+        return
+
+    if args.compare_epochs:
+        compare_epochs(args.cluster, run_sub_dir)
+        return
+
+    # Fast path: --full alone fetches only the one pair needed (works for large files)
+    if args.full is not None and not args.summary and not args.show and not args.filter:
+        n = fetch_pair_count(args.cluster, run_sub_dir, args.epoch)
+        print(f"{n} pairs in epoch {args.epoch}")
+        p = fetch_single_pair(args.cluster, run_sub_dir, args.epoch, args.full)
+        show_pairs([None] * args.full + [p], [args.full], full_index=args.full)
+        return
+
+    # Fast path: --show without --filter fetches only the pairs needed
+    if args.show and not args.filter and not args.summary and args.full is None:
+        n = fetch_pair_count(args.cluster, run_sub_dir, args.epoch)
+        print(f"{n} pairs in epoch {args.epoch}")
+        pairs, indices = fetch_random_pairs(args.cluster, run_sub_dir, args.epoch, args.show, args.seed)
+        # Build a sparse list so indices display correctly
+        sparse = [None] * (max(indices) + 1) if indices else []
+        for idx, p in zip(indices, pairs):
+            sparse[idx] = p
+        show_pairs(sparse, indices)
+        return
+
+    # Fast path: --summary alone uses remote computation (no bulk download)
+    if args.summary and not args.filter and not args.show and args.full is None:
+        result = fetch_remote_summary(args.cluster, run_sub_dir, args.epoch)
+        if result:
+            print(f"\n{'='*60}")
+            print(f"SUMMARY (epoch {args.epoch})")
+            print(f"{'='*60}")
+            print(result)
+        return
+
+    # Fast path: default (no flags) uses remote summary
+    if not args.summary and not args.show and args.full is None and not args.filter:
+        result = fetch_remote_summary(args.cluster, run_sub_dir, args.epoch)
+        if result:
+            print(f"\n{'='*60}")
+            print(f"SUMMARY (epoch {args.epoch})")
+            print(f"{'='*60}")
+            print(result)
+        return
+
+    # Bulk fetch all pairs (only for --filter which needs full data)
+    pairs = fetch_pairs(args.cluster, run_sub_dir, args.epoch)
+    print(f"Loaded {len(pairs)} pairs from epoch {args.epoch}")
+
+    # Apply filter
+    if args.filter:
+        filtered = []
+        for i, p in enumerate(pairs):
+            c = extract_answer(p.get("chosen", ""))
+            r = extract_answer(p.get("rejected", ""))
+            if args.filter == "same" and c and r and c == r:
+                filtered.append((i, p))
+            elif args.filter == "diff" and c and r and c != r:
+                filtered.append((i, p))
+            elif args.filter == "no_answer" and (c is None or r is None):
+                filtered.append((i, p))
+            elif args.filter == "meta" and has_meta_commentary(p):
+                filtered.append((i, p))
+        print(f"Filter '{args.filter}': {len(filtered)}/{len(pairs)} pairs match")
+        if not filtered:
+            return
+        # Show summary of filtered
+        if args.summary:
+            show_summary([p for _, p in filtered])
+        # Show pairs
+        n_show = args.show or min(3, len(filtered))
+        random.seed(args.seed)
+        sample = random.sample(filtered, min(n_show, len(filtered)))
+        show_pairs(pairs, [i for i, _ in sample], args.full)
+        return
+
+    if args.summary:
+        show_summary(pairs)
+
+    if args.show:
+        random.seed(args.seed)
+        indices = random.sample(range(len(pairs)), min(args.show, len(pairs)))
+        show_pairs(pairs, indices)
+
+    if args.full is not None:
+        show_pairs(pairs, [args.full], full_index=args.full)
+
+    if not args.summary and not args.show and args.full is None:
+        show_summary(pairs)
+
+
+if __name__ == "__main__":
+    main()

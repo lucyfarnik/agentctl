@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""DELETE runs and artifacts from Weights & Biases. This is destructive and irreversible.
+
+Usage:
+  lwandb-delete run <run_id>                    # Delete a specific run
+  lwandb-delete runs --status crashed           # Delete all crashed runs
+  lwandb-delete runs --before 2026-02-01        # Delete runs before a date
+  lwandb-delete runs --status crashed --before 2026-02-01  # Combine filters
+  lwandb-delete artifacts --before 2026-01-01   # Delete artifacts before date
+  lwandb-delete artifacts --run-status crashed   # Delete artifacts from crashed runs
+  lwandb-delete artifacts --run-status failed --run-status crashed  # Combine
+  lwandb-delete artifacts --type dataset        # Delete artifacts of a type
+
+All commands require confirmation unless --yes is passed.
+Use lwandb (without -delete) to browse first.
+"""
+
+import argparse
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+import wandb
+
+MAX_WORKERS = 16
+
+
+def get_api():
+    return wandb.Api()
+
+
+def fmt_size(bytes_val):
+    """Format bytes as human-readable size."""
+    if bytes_val is None or bytes_val == 0:
+        return "0 B"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(bytes_val) < 1024:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f} PB"
+
+
+def fmt_date(dt_str):
+    """Format datetime string to short date."""
+    if not dt_str:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return str(dt_str)[:10]
+
+
+def parse_date(date_str):
+    """Parse a date string to datetime."""
+    for fmt in ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d"]:
+        try:
+            return datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    print(f"Error: couldn't parse date '{date_str}'. Use YYYY-MM-DD format.")
+    sys.exit(1)
+
+
+def get_runs(api, project, entity=None, status=None, before=None):
+    """Fetch runs with optional filters."""
+    path = f"{entity}/{project}" if entity else project
+    filters = {}
+    if status:
+        filters["state"] = status
+
+    runs = api.runs(path, filters=filters)
+
+    if before:
+        cutoff = parse_date(before)
+        runs = [r for r in runs if datetime.fromisoformat(
+            r.created_at.replace("Z", "+00:00")) < cutoff]
+    else:
+        runs = list(runs)
+
+    return runs
+
+
+def run_size_bytes(run):
+    """Estimate a run's storage usage from its files."""
+    total = 0
+    try:
+        for f in run.files():
+            total += f.size or 0
+    except Exception:
+        pass
+    return total
+
+
+def get_run_artifacts(run):
+    """Get artifacts for a single run. Returns list of (artifact, size, run_info)."""
+    results = []
+    try:
+        for art in run.logged_artifacts():
+            results.append((art, art.size or 0, {
+                "run_id": run.id,
+                "run_name": run.name,
+                "run_state": run.state,
+                "run_created": run.created_at,
+            }))
+    except Exception:
+        pass
+    return results
+
+
+def cmd_delete_run(args):
+    """Delete a specific run."""
+    api = get_api()
+    path = f"{args.entity}/{args.project}" if args.entity else args.project
+    try:
+        run = api.run(f"{path}/{args.run_id}")
+    except Exception as e:
+        print(f"Error: could not find run '{args.run_id}': {e}")
+        sys.exit(1)
+
+    size = run_size_bytes(run)
+    print(f"Run: {run.id}  ({run.name})")
+    print(f"  Status: {run.state}")
+    print(f"  Created: {fmt_date(run.created_at)}")
+    print(f"  Size: {fmt_size(size)}")
+
+    if not args.yes:
+        resp = input("\nDELETE this run? This is irreversible. [y/N] ").strip().lower()
+        if resp != "y":
+            print("Aborted.")
+            return
+
+    run.delete()
+    print(f"Deleted run {run.id} (freed ~{fmt_size(size)})")
+
+
+def cmd_delete_runs(args):
+    """Delete runs matching filters."""
+    if not args.status and not args.before:
+        print("Error: must specify --status and/or --before to filter runs.")
+        print("Refusing to delete all runs without any filter.")
+        sys.exit(1)
+
+    api = get_api()
+    print("Fetching runs...", file=sys.stderr)
+    runs = get_runs(api, args.project, args.entity, status=args.status, before=args.before)
+
+    if not runs:
+        print("No runs match the filter.")
+        return
+
+    print(f"Calculating sizes for {len(runs)} matching runs ({MAX_WORKERS} threads)...", file=sys.stderr)
+    total_size = 0
+    run_sizes = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(run_size_bytes, r): r for r in runs}
+        for future in as_completed(futures):
+            run = futures[future]
+            size = future.result()
+            total_size += size
+            run_sizes.append((run, size))
+            done += 1
+            if done % 20 == 0:
+                print(f"  sized {done}/{len(runs)}...", file=sys.stderr)
+
+    print(f"\nRuns to DELETE ({len(runs)}):\n")
+    print(f"  {'Run ID':<12} {'Name':<40} {'Status':<10} {'Date':<12} {'Size':>10}")
+    print("  " + "-" * 86)
+
+    for run, size in run_sizes:
+        name = (run.name or "?")[:38]
+        print(f"  {run.id:<12} {name:<40} {run.state:<10} {fmt_date(run.created_at):<12} {fmt_size(size):>10}")
+
+    print(f"\n  Total: {fmt_size(total_size)} across {len(runs)} runs")
+
+    if not args.yes:
+        resp = input(f"\nDELETE all {len(runs)} runs? This is irreversible. [y/N] ").strip().lower()
+        if resp != "y":
+            print("Aborted.")
+            return
+
+    deleted = 0
+    for run, size in run_sizes:
+        try:
+            run.delete()
+            print(f"  deleted {run.id} ({run.name})")
+            deleted += 1
+        except Exception as e:
+            print(f"  FAILED to delete {run.id}: {e}")
+
+    print(f"\nDone. Deleted {deleted}/{len(runs)} runs, freed ~{fmt_size(total_size)}")
+
+
+def cmd_delete_artifacts(args):
+    """Delete artifact versions matching filters. Uses parallel per-run queries."""
+    if not args.before and not args.type and not args.run_status:
+        print("Error: must specify --before, --type, and/or --run-status to filter.")
+        print("Refusing to delete all artifacts without any filter.")
+        sys.exit(1)
+
+    api = get_api()
+
+    # Determine which runs to scan for artifacts
+    if args.run_status:
+        # Fetch runs matching each requested status
+        all_runs = []
+        for status in args.run_status:
+            print(f"Fetching {status} runs...", file=sys.stderr)
+            all_runs.extend(get_runs(api, args.project, args.entity, status=status))
+        runs = all_runs
+    else:
+        print("Fetching all runs...", file=sys.stderr)
+        runs = get_runs(api, args.project, args.entity)
+
+    print(f"Scanning {len(runs)} runs for artifacts ({MAX_WORKERS} threads)...", file=sys.stderr)
+
+    # Parallel artifact collection
+    all_artifacts = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(get_run_artifacts, r): r for r in runs}
+        for future in as_completed(futures):
+            arts = future.result()
+            all_artifacts.extend(arts)
+            done += 1
+            if done % 50 == 0:
+                print(f"  scanned {done}/{len(runs)} runs...", file=sys.stderr)
+
+    # Apply filters
+    filtered = []
+    cutoff = parse_date(args.before) if args.before else None
+
+    for art, size, run_info in all_artifacts:
+        # Skip system-managed artifacts (can only be deleted by deleting the run)
+        if art.type in ("wandb-history", "wandb-metadata"):
+            continue
+        # Filter by artifact type
+        if args.type and art.type != args.type:
+            continue
+        # Filter by date
+        if cutoff:
+            created = getattr(art, "created_at", None)
+            if created:
+                try:
+                    art_date = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    if art_date >= cutoff:
+                        continue
+                except (ValueError, AttributeError):
+                    continue
+        filtered.append((art, size, run_info))
+
+    # Deduplicate by artifact name (same artifact can appear via multiple runs)
+    unique = {}
+    for art, size, run_info in filtered:
+        if art.name not in unique:
+            unique[art.name] = (art, size, run_info)
+
+    artifacts_to_delete = sorted(unique.values(), key=lambda x: x[1], reverse=True)
+
+    if not artifacts_to_delete:
+        print("No artifacts match the filter.")
+        return
+
+    total_size = sum(s for _, s, _ in artifacts_to_delete)
+
+    print(f"\nArtifacts to DELETE ({len(artifacts_to_delete)}):\n")
+    for art, size, run_info in artifacts_to_delete[:30]:
+        created = fmt_date(art.created_at) if hasattr(art, "created_at") else "?"
+        run_name = (run_info.get("run_name") or "?")[:20]
+        print(f"  {art.name:<45} {fmt_size(size):>10}  {created}  {run_name}")
+    if len(artifacts_to_delete) > 30:
+        print(f"  ... and {len(artifacts_to_delete) - 30} more")
+
+    print(f"\n  Total: {fmt_size(total_size)} across {len(artifacts_to_delete)} unique artifact versions")
+
+    if not args.yes:
+        resp = input(f"\nDELETE all {len(artifacts_to_delete)} artifact versions? This is irreversible. [y/N] ").strip().lower()
+        if resp != "y":
+            print("Aborted.")
+            return
+
+    deleted = 0
+    failed = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        def delete_one(art_info):
+            art, size, _ = art_info
+            # Remove aliases first (W&B won't delete artifacts with aliases)
+            try:
+                for alias in list(art.aliases):
+                    art.aliases.remove(alias)
+                art.save()
+            except Exception:
+                pass
+            art.delete()
+            return art.name, size
+
+        futures = {pool.submit(delete_one, a): a for a in artifacts_to_delete}
+        for future in as_completed(futures):
+            try:
+                name, size = future.result()
+                deleted += 1
+                if deleted % 20 == 0:
+                    print(f"  deleted {deleted}/{len(artifacts_to_delete)}...", file=sys.stderr)
+            except Exception as e:
+                art_info = futures[future]
+                print(f"  FAILED: {art_info[0].name}: {e}")
+                failed += 1
+
+    print(f"\nDone. Deleted {deleted}/{len(artifacts_to_delete)} artifacts"
+          f"{f' ({failed} failed)' if failed else ''}, freed ~{fmt_size(total_size)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="DELETE W&B runs and artifacts. Irreversible! Use lwandb to browse first.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--project", "-p", default="qualitative_feedback", help="W&B project name")
+    parser.add_argument("--entity", "-e", default=None, help="W&B entity (team/user)")
+
+    sub = parser.add_subparsers(dest="command")
+
+    # delete single run
+    p_run = sub.add_parser("run", help="Delete a specific run by ID")
+    p_run.add_argument("run_id", help="Run ID to delete")
+    p_run.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+
+    # delete multiple runs
+    p_runs = sub.add_parser("runs", help="Delete runs matching filters")
+    p_runs.add_argument("--status", "-s", help="Filter by status (crashed/failed/finished/running)")
+    p_runs.add_argument("--before", "-b", help="Only runs created before date (YYYY-MM-DD)")
+    p_runs.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+
+    # delete artifacts
+    p_art = sub.add_parser("artifacts", help="Delete artifacts matching filters")
+    p_art.add_argument("--before", "-b", help="Only artifacts created before date (YYYY-MM-DD)")
+    p_art.add_argument("--run-status", action="append", help="Only artifacts from runs with this status (can repeat: --run-status crashed --run-status failed)")
+    p_art.add_argument("--type", "-t", help="Filter by artifact type")
+    p_art.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+    elif args.command == "run":
+        cmd_delete_run(args)
+    elif args.command == "runs":
+        cmd_delete_runs(args)
+    elif args.command == "artifacts":
+        cmd_delete_artifacts(args)
+
+
+if __name__ == "__main__":
+    main()

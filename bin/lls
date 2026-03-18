@@ -1,0 +1,30 @@
+#!/bin/bash
+# List files on a remote cluster
+# Usage: lls <cluster> [remote_path]
+#
+# Examples:
+#   lls bp logs/
+#   lls mn logs/ -g "epoch"
+
+if [ $# -lt 1 ]; then
+    echo "Usage: lls <cluster> [remote_path] [-g pattern]"
+    echo "  cluster: bp, mn, is"
+    echo "  remote_path: path relative to ~/work/qualitative_feedback/ (default: .)"
+    exit 1
+fi
+
+CLUSTER="$1"
+REMOTE_PATH="${2:-.}"
+GREP_PATTERN=""
+
+if [ "$3" = "-g" ] && [ -n "$4" ]; then
+    GREP_PATTERN="$4"
+fi
+
+FULL_PATH="~/work/qualitative_feedback/$REMOTE_PATH"
+
+if [ -n "$GREP_PATTERN" ]; then
+    ssh "$CLUSTER" "ls $FULL_PATH | grep '$GREP_PATTERN'"
+else
+    ssh "$CLUSTER" "ls $FULL_PATH"
+fi

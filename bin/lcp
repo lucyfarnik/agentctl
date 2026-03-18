@@ -1,0 +1,35 @@
+#!/bin/bash
+# Copy a file from a remote HPC cluster to a local directory
+# Usage: lcp <cluster> <remote_path> [local_path]
+#
+# remote_path: relative to ~/work/qualitative_feedback/
+# local_path:  optional, defaults to /tmp/<basename>
+#
+# Examples:
+#   lcp is artifacts/1772618498-job2594282/distillation_examples_epoch_0.jsonl
+#   lcp bp artifacts/run123/examples.jsonl ./examples.jsonl
+
+if [ $# -lt 2 ]; then
+    echo "Usage: lcp <cluster> <remote_path> [local_path]"
+    echo "  cluster: bp, mn, is"
+    echo "  remote_path: path relative to ~/work/qualitative_feedback/"
+    echo "  local_path:  optional, defaults to /tmp/<basename>"
+    exit 1
+fi
+
+CLUSTER="$1"
+REMOTE_PATH="$2"
+LOCAL_PATH="${3:-/tmp/$(basename "$REMOTE_PATH")}"
+
+FULL_REMOTE="~/work/qualitative_feedback/$REMOTE_PATH"
+
+echo "Copying $CLUSTER:$FULL_REMOTE -> $LOCAL_PATH"
+scp "$CLUSTER:$FULL_REMOTE" "$LOCAL_PATH" 2>/dev/null
+
+if [ $? -eq 0 ]; then
+    echo "Saved to: $LOCAL_PATH"
+    echo "Size: $(du -h "$LOCAL_PATH" | cut -f1)"
+else
+    echo "Failed to copy file" >&2
+    exit 1
+fi

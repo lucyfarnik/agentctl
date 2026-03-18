@@ -1,0 +1,30 @@
+#!/bin/bash
+# Fetch and display a file from a remote cluster
+# Usage: lcat <cluster> <remote_path> [--head N]
+#
+# Examples:
+#   lcat bp logs/examples_epoch_1.jsonl
+#   lcat mn logs/examples_epoch_1.jsonl --head 5
+
+if [ $# -lt 2 ]; then
+    echo "Usage: lcat <cluster> <remote_path> [--head N]"
+    echo "  cluster: bp, mn, is"
+    echo "  remote_path: path relative to ~/work/qualitative_feedback/"
+    exit 1
+fi
+
+CLUSTER="$1"
+REMOTE_PATH="$2"
+HEAD_N=""
+
+if [ "$3" = "--head" ] && [ -n "$4" ]; then
+    HEAD_N="$4"
+fi
+
+FULL_PATH="~/work/qualitative_feedback/$REMOTE_PATH"
+
+if [ -n "$HEAD_N" ]; then
+    ssh "$CLUSTER" "head -n $HEAD_N $FULL_PATH"
+else
+    ssh "$CLUSTER" "cat $FULL_PATH"
+fi

@@ -1,0 +1,70 @@
+#!/bin/zsh
+
+# Get detailed job or node-level job info on HPC clusters
+# Usage:
+#   ljob bp 12345       - Detailed info for job 12345
+#   ljob bp 12345 -v    - Full scontrol output for job
+#   ljob is -n nodename - Show all jobs on a specific node
+#   ljob bp -a          - Show all users' jobs (not just yours)
+
+CLUSTER=""
+JOB_ID=""
+NODE=""
+ALL_USERS="false"
+VERBOSE="false"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        bp|mn|is)
+            CLUSTER=$1
+            shift
+            ;;
+        -n|--node)
+            NODE=$2
+            shift 2
+            ;;
+        -a|--all)
+            ALL_USERS="true"
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE="true"
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: ljob [bp|mn|is] [job_id] [-n node] [-a] [-v]"
+            echo "  ljob bp 12345       - Detailed info for job 12345"
+            echo "  ljob bp 12345 -v    - Full scontrol output for job"
+            echo "  ljob bp -n gpu038   - Jobs running on node gpu038"
+            echo "  ljob bp -a          - All users' jobs"
+            exit 0
+            ;;
+        [0-9]*)
+            JOB_ID=$1
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$CLUSTER" ]]; then
+    echo "Usage: ljob [bp|mn|is] [job_id] [-n node] [-a]"
+    exit 1
+fi
+
+FMT='%i %u %P %j %T %M %l %D %C %b %R'
+
+if [[ -n "$JOB_ID" && "$VERBOSE" == "true" ]]; then
+    ssh "$CLUSTER" "scontrol show job $JOB_ID" 2>/dev/null
+elif [[ -n "$JOB_ID" ]]; then
+    ssh "$CLUSTER" "squeue -j $JOB_ID -o '$FMT' 2>/dev/null || scontrol show job $JOB_ID" 2>/dev/null
+elif [[ -n "$NODE" ]]; then
+    ssh "$CLUSTER" "squeue -w '${NODE}' -o '$FMT'" 2>/dev/null
+elif [[ "$ALL_USERS" == "true" ]]; then
+    ssh "$CLUSTER" "squeue -o '$FMT'" 2>/dev/null
+else
+    ssh "$CLUSTER" "squeue -u \$USER -o '$FMT'" 2>/dev/null
+fi

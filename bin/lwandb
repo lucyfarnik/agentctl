@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Browse Weights & Biases storage for the qualitative_feedback project (read-only).
+
+Usage:
+  lwandb                        # Summary: runs grouped by status, total storage
+  lwandb runs                   # List all runs with size, sorted by size desc
+  lwandb runs --status crashed  # Filter by status (crashed/failed/finished/running)
+  lwandb runs --before 2026-02-01  # Runs created before a date
+  lwandb runs --sort date       # Sort by date instead of size
+  lwandb artifacts              # List all artifacts with sizes
+  lwandb artifacts --type dataset  # Filter by artifact type
+  lwandb big                    # Show biggest storage consumers (tables + artifacts)
+  lwandb big -n 5               # Top 5 runs by size with file breakdown
+  lwandb project [name]         # Use a different project (default: qualitative_feedback)
+
+See also: lwandb-delete (separate tool for destructive operations)
+"""
+
+import argparse
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+
+import wandb
+
+MAX_WORKERS = 16
+
+
+def get_api():
+    return wandb.Api()
+
+
+def fmt_size(bytes_val):
+    """Format bytes as human-readable size."""
+    if bytes_val is None or bytes_val == 0:
+        return "0 B"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if abs(bytes_val) < 1024:
+            return f"{bytes_val:.1f} {unit}"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f} PB"
+
+
+def fmt_date(dt_str):
+    """Format datetime string to short date."""
+    if not dt_str:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return str(dt_str)[:10]
+
+
+def parse_date(date_str):
+    """Parse a date string to datetime."""
+    for fmt in ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d"]:
+        try:
+            return datetime.strptime(date_str, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    print(f"Error: couldn't parse date '{date_str}'. Use YYYY-MM-DD format.")
+    sys.exit(1)
+
+
+def get_runs(api, project, entity=None, status=None, before=None):
+    """Fetch runs with optional filters."""
+    path = f"{entity}/{project}" if entity else project
+    filters = {}
+    if status:
+        filters["state"] = status
+
+    runs = api.runs(path, filters=filters)
+
+    if before:
+        cutoff = parse_date(before)
+        runs = [r for r in runs if datetime.fromisoformat(
+            r.created_at.replace("Z", "+00:00")) < cutoff]
+    else:
+        runs = list(runs)
+
+    return runs
+
+
+def run_size_bytes(run):
+    """Estimate a run's storage usage from its files."""
+    total = 0
+    try:
+        for f in run.files():
+            total += f.size or 0
+    except Exception:
+        pass
+    return total
+
+
+def run_size_parallel(runs):
+    """Compute sizes for a list of runs in parallel. Returns list of (run, size)."""
+    results = []
+    done = 0
+    total = len(runs)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(run_size_bytes, r): r for r in runs}
+        for future in as_completed(futures):
+            run = futures[future]
+            size = future.result()
+            results.append((run, size))
+            done += 1
+            if done % 20 == 0:
+                print(f"  sized {done}/{total} runs...", file=sys.stderr)
+    return results
+
+
+def get_run_files_breakdown(run):
+    """Get per-file breakdown of a run's storage."""
+    files = []
+    try:
+        for f in run.files():
+            files.append((f.name, f.size or 0))
+    except Exception:
+        pass
+    files.sort(key=lambda x: x[1], reverse=True)
+    return files
+
+
+def get_run_artifacts_info(run):
+    """Get artifact info for a single run. Returns list of dicts."""
+    artifacts = []
+    try:
+        for art in run.logged_artifacts():
+            artifacts.append({
+                "name": art.name,
+                "type": art.type,
+                "size": art.size or 0,
+                "created": art.created_at if hasattr(art, "created_at") else "?",
+                "state": art.state if hasattr(art, "state") else "?",
+                "run_id": run.id,
+                "run_name": run.name,
+            })
+    except Exception:
+        pass
+    return artifacts
+
+
+def cmd_summary(args):
+    """Show project summary grouped by run status."""
+    api = get_api()
+    print(f"Fetching runs from '{args.project}'...")
+    runs = get_runs(api, args.project, args.entity)
+    print(f"Found {len(runs)} runs. Calculating sizes ({MAX_WORKERS} threads)...\n")
+
+    results = run_size_parallel(runs)
+
+    by_status = {}
+    total_bytes = 0
+    for run, size in results:
+        status = run.state
+        total_bytes += size
+        if status not in by_status:
+            by_status[status] = {"count": 0, "bytes": 0, "runs": []}
+        by_status[status]["count"] += 1
+        by_status[status]["bytes"] += size
+        by_status[status]["runs"].append(run)
+
+    print(f"{'Status':<12} {'Count':>6} {'Size':>10} {'Oldest':>12} {'Newest':>12}")
+    print("-" * 56)
+    for status in sorted(by_status, key=lambda s: by_status[s]["bytes"], reverse=True):
+        info = by_status[status]
+        dates = [r.created_at for r in info["runs"]]
+        oldest = fmt_date(min(dates)) if dates else "?"
+        newest = fmt_date(max(dates)) if dates else "?"
+        print(f"{status:<12} {info['count']:>6} {fmt_size(info['bytes']):>10} {oldest:>12} {newest:>12}")
+
+    print("-" * 56)
+    print(f"{'TOTAL':<12} {len(runs):>6} {fmt_size(total_bytes):>10}")
+
+    # Artifact summary via parallel per-run queries
+    print(f"\nFetching artifacts ({MAX_WORKERS} threads)...", file=sys.stderr)
+    all_artifacts = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(get_run_artifacts_info, r): r for r in runs}
+        for future in as_completed(futures):
+            arts = future.result()
+            all_artifacts.extend(arts)
+            done += 1
+            if done % 50 == 0:
+                print(f"  scanned {done}/{len(runs)} runs for artifacts...", file=sys.stderr)
+
+    if all_artifacts:
+        artifact_bytes = sum(a["size"] for a in all_artifacts)
+        # Deduplicate by name (same artifact version can appear in multiple runs)
+        unique = {a["name"]: a for a in all_artifacts}
+        unique_bytes = sum(a["size"] for a in unique.values())
+        print(f"\nArtifacts: {len(all_artifacts)} logged ({len(unique)} unique versions), {fmt_size(unique_bytes)}")
+    else:
+        print("\nNo artifacts found.")
+
+
+def cmd_runs(args):
+    """List runs with sizes."""
+    api = get_api()
+    print(f"Fetching runs from '{args.project}'...", file=sys.stderr)
+    runs = get_runs(api, args.project, args.entity, status=args.status, before=args.before)
+    print(f"Calculating sizes for {len(runs)} runs ({MAX_WORKERS} threads)...", file=sys.stderr)
+
+    results = run_size_parallel(runs)
+
+    run_data = [
+        {"id": r.id, "name": r.name, "status": r.state, "created": r.created_at, "size": s}
+        for r, s in results
+    ]
+
+    if args.sort == "date":
+        run_data.sort(key=lambda r: r["created"], reverse=True)
+    else:
+        run_data.sort(key=lambda r: r["size"], reverse=True)
+
+    print(f"\n{'Run ID':<12} {'Name':<40} {'Status':<10} {'Date':<12} {'Size':>10}")
+    print("-" * 88)
+    for rd in run_data:
+        name = (rd["name"] or "?")[:38]
+        print(f"{rd['id']:<12} {name:<40} {rd['status']:<10} {fmt_date(rd['created']):<12} {fmt_size(rd['size']):>10}")
+
+    total = sum(r["size"] for r in run_data)
+    print("-" * 88)
+    print(f"{'':>64} Total: {fmt_size(total):>10}")
+
+
+def cmd_big(args):
+    """Show the biggest storage consumers with file-level breakdown."""
+    api = get_api()
+    print(f"Fetching runs from '{args.project}'...", file=sys.stderr)
+    runs = get_runs(api, args.project, args.entity)
+    print(f"Calculating sizes for {len(runs)} runs ({MAX_WORKERS} threads)...", file=sys.stderr)
+
+    results = run_size_parallel(runs)
+    results.sort(key=lambda x: x[1], reverse=True)
+    top_n = args.top or 10
+
+    print(f"\nTop {top_n} runs by storage:\n")
+    for run, size in results[:top_n]:
+        print(f"  {run.id}  {(run.name or '?')[:40]:<40}  {run.state:<10}  {fmt_date(run.created_at)}  {fmt_size(size)}")
+        files = get_run_files_breakdown(run)
+        # Group files by type/pattern
+        table_bytes = sum(s for n, s in files if "table" in n.lower() or n.endswith(".json"))
+        media_bytes = sum(s for n, s in files if "media" in n.lower() or n.endswith((".png", ".jpg")))
+        log_bytes = sum(s for n, s in files if "log" in n.lower() or n.endswith(".log"))
+        other_bytes = size - table_bytes - media_bytes - log_bytes
+
+        if files:
+            print(f"    tables/json: {fmt_size(table_bytes)},  media: {fmt_size(media_bytes)},  logs: {fmt_size(log_bytes)},  other: {fmt_size(other_bytes)}")
+            # Show top 5 individual files
+            for fname, fsize in files[:5]:
+                print(f"      {fname}: {fmt_size(fsize)}")
+        print()
+
+
+def cmd_artifacts(args):
+    """List artifacts with sizes, queried per-run in parallel."""
+    api = get_api()
+    print(f"Fetching runs from '{args.project}'...", file=sys.stderr)
+    runs = get_runs(api, args.project, args.entity)
+    print(f"Scanning {len(runs)} runs for artifacts ({MAX_WORKERS} threads)...", file=sys.stderr)
+
+    all_artifacts = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(get_run_artifacts_info, r): r for r in runs}
+        for future in as_completed(futures):
+            arts = future.result()
+            all_artifacts.extend(arts)
+            done += 1
+            if done % 50 == 0:
+                print(f"  scanned {done}/{len(runs)} runs...", file=sys.stderr)
+
+    # Filter by type if requested
+    if args.type:
+        all_artifacts = [a for a in all_artifacts if a["type"] == args.type]
+
+    # Deduplicate by name (same artifact can be logged by multiple runs)
+    unique = {}
+    for a in all_artifacts:
+        if a["name"] not in unique or a["size"] > unique[a["name"]]["size"]:
+            unique[a["name"]] = a
+
+    artifacts = sorted(unique.values(), key=lambda a: a["size"], reverse=True)
+
+    print(f"\n{'Name':<50} {'Type':<12} {'Size':>10} {'Date':<12} {'Run':<12}")
+    print("-" * 100)
+    for a in artifacts:
+        name = a["name"][:48]
+        run_name = (a.get("run_name") or "?")[:10]
+        print(f"{name:<50} {a['type']:<12} {fmt_size(a['size']):>10} {fmt_date(a['created']):<12} {run_name:<12}")
+
+    total = sum(a["size"] for a in artifacts)
+    print("-" * 100)
+    print(f"{'':>50} {'':>12} {fmt_size(total):>10}  ({len(artifacts)} unique artifacts)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Browse W&B storage (read-only). See lwandb-delete for deletion.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("--project", "-p", default="qualitative_feedback", help="W&B project name")
+    parser.add_argument("--entity", "-e", default=None, help="W&B entity (team/user)")
+
+    sub = parser.add_subparsers(dest="command")
+
+    # summary (default)
+    sub.add_parser("summary", help="Project summary by status")
+
+    # runs
+    p_runs = sub.add_parser("runs", help="List runs with sizes")
+    p_runs.add_argument("--status", "-s", help="Filter by status (crashed/failed/finished/running)")
+    p_runs.add_argument("--before", "-b", help="Only runs created before date (YYYY-MM-DD)")
+    p_runs.add_argument("--sort", choices=["size", "date"], default="size", help="Sort order")
+
+    # big
+    p_big = sub.add_parser("big", help="Show biggest storage consumers with breakdown")
+    p_big.add_argument("--top", "-n", type=int, default=10, help="Number of top runs to show")
+
+    # artifacts
+    p_art = sub.add_parser("artifacts", help="List artifacts with sizes")
+    p_art.add_argument("--type", "-t", help="Filter by artifact type")
+
+    args = parser.parse_args()
+
+    if args.command is None or args.command == "summary":
+        cmd_summary(args)
+    elif args.command == "runs":
+        cmd_runs(args)
+    elif args.command == "big":
+        cmd_big(args)
+    elif args.command == "artifacts":
+        cmd_artifacts(args)
+
+
+if __name__ == "__main__":
+    main()

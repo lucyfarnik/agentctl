@@ -1,0 +1,88 @@
+# Shared HPC project config loader
+# Usage: source "$(dirname "$0")/../lib/_hpc_project_config"
+# Then call: resolve_project "$PROJECT_ALIAS"
+# After call: WORK_DIR and LOCAL_LOGS are set
+
+_AGENTCTL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+_HPC_PROJECTS_FILE="$_AGENTCTL_ROOT/config/.hpc_projects"
+
+resolve_project() {
+    local alias=$1
+    local config_file="$_HPC_PROJECTS_FILE"
+
+    if [[ ! -f "$config_file" ]]; then
+        echo "${RED:-}Error: Config file not found: $config_file${NC:-}" >&2
+        exit 1
+    fi
+
+    local default_alias=""
+    local first_alias=""
+    local found="false"
+
+    # If no alias given, try to autodetect from pwd, then fall back to default
+    if [[ -z "$alias" ]]; then
+        local cwd="$PWD"
+        # Try matching pwd against each project's local path
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            local entry="${line#\*}"
+            local a="${entry%%:*}"
+            local rest="${entry#*:}"
+            local local_raw="${rest#*:}"
+            local local_expanded="${local_raw/#\~/$HOME}"
+            local project_root="${local_expanded%/logs}"
+            # Match if pwd is the project root, logs dir, or any subdirectory
+            if [[ "$cwd" == "$project_root" || "$cwd" == "$project_root/"* || \
+                  "$cwd" == "$local_expanded" || "$cwd" == "$local_expanded/"* ]]; then
+                alias="$a"
+                break
+            fi
+        done < "$config_file"
+    fi
+
+    # If still no alias, use the default
+    if [[ -z "$alias" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            local entry="${line#\*}"
+            local a="${entry%%:*}"
+            if [[ -z "$first_alias" ]]; then
+                first_alias="$a"
+            fi
+            if [[ "$line" == \** ]]; then
+                default_alias="$a"
+                break
+            fi
+        done < "$config_file"
+        alias="${default_alias:-$first_alias}"
+    fi
+
+    # Look up the alias
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        local entry="${line#\*}"
+        local a="${entry%%:*}"
+        if [[ "$a" == "$alias" ]]; then
+            local rest="${entry#*:}"
+            WORK_DIR="${rest%%:*}"
+            local local_raw="${rest#*:}"
+            LOCAL_LOGS="${local_raw/#\~/$HOME}"
+            found="true"
+            break
+        fi
+    done < "$config_file"
+
+    if [[ "$found" != "true" ]]; then
+        echo "${RED:-}Error: Unknown project '$alias'${NC:-}" >&2
+        echo "Available projects:" >&2
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            local entry="${line#\*}"
+            local a="${entry%%:*}"
+            local dflt=""
+            [[ "$line" == \** ]] && dflt=" (default)"
+            echo "  $a$dflt" >&2
+        done < "$config_file"
+        exit 1
+    fi
+}

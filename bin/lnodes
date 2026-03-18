@@ -1,0 +1,56 @@
+#!/bin/zsh
+
+# Check node status on HPC clusters
+# Usage:
+#   lnodes bp          - Show GPU node status on BluePebble
+#   lnodes is          - Show GPU node status on Isambard
+#   lnodes bp gpu038   - Show specific node
+
+CLUSTER=""
+NODE_FILTER=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        bp|mn|is)
+            CLUSTER=$1
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: lnodes [bp|mn|is] [node_name]"
+            echo "  lnodes bp          - GPU nodes on BluePebble"
+            echo "  lnodes is          - GPU nodes on Isambard"
+            echo "  lnodes bp gpu038   - Filter to specific node"
+            exit 0
+            ;;
+        *)
+            NODE_FILTER=$1
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$CLUSTER" ]]; then
+    echo "Usage: lnodes [bp|mn|is] [node_name]"
+    exit 1
+fi
+
+show_nodes() {
+    local cluster=$1
+    local filter=$2
+
+    if [[ -n "$filter" ]]; then
+        ssh "$cluster" "sinfo -N -l --nodes='*${filter}*' 2>/dev/null || sinfo -N -l | head -1; sinfo -N -l | grep -i '$filter'" 2>/dev/null
+    else
+        # Show GPU nodes only
+        case $cluster in
+            bp)
+                ssh "$cluster" "sinfo -p cnu -N -l" 2>/dev/null
+                ;;
+            *)
+                ssh "$cluster" "sinfo -N -l" 2>/dev/null
+                ;;
+        esac
+    fi
+}
+
+show_nodes "$CLUSTER" "$NODE_FILTER"

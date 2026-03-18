@@ -1,0 +1,219 @@
+#!/bin/zsh
+# Fetch logs from HPC clusters (copies locally, then processes)
+# Usage:
+#   llogs              - Show recent logs from all clusters
+#   llogs bp           - Show recent logs from BluePebble only
+#   llogs mn 12345     - Show log for job 12345 on MareNostrum
+#   llogs bp -f 12345  - Follow (tail -f) log for job 12345 on BluePebble
+#   llogs -l           - List log files on all clusters
+#   llogs bp 12345 -g "accuracy"  - Grep for pattern in job log
+#   llogs bp 12345 -e  - Show error log instead of stdout
+#   llogs -p aas bp    - Show recent logs from aas project on BluePebble
+#   llogs bp -w 300    - Wait 5 minutes, then show recent logs
+
+set -e
+
+LOCAL_CACHE="/tmp/llogs_cache"
+mkdir -p "$LOCAL_CACHE"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+# Copy a log file locally and return local path
+copy_log_locally() {
+    local cluster=$1
+    local remote_path=$2
+    local local_name="${cluster}_$(basename $remote_path)"
+    local local_path="$LOCAL_CACHE/$local_name"
+
+    scp -q "$cluster:~/$remote_path" "$local_path" 2>/dev/null
+    if [[ $? -eq 0 ]]; then
+        echo "$local_path"
+    else
+        echo ""
+    fi
+}
+
+# Get the most recent log file path on a cluster
+get_latest_log_path() {
+    local cluster=$1
+    local err_mode=$2
+
+    local ext="out"
+    [[ "$err_mode" == "true" ]] && ext="err"
+
+    # Find most recent log across both naming conventions
+    ssh "$cluster" "
+        cd ~/$WORK_DIR 2>/dev/null || exit 1
+        { ls -t logs/qf_*.$ext 2>/dev/null; ls -t slurm-*.$ext 2>/dev/null; } | head -1
+    " 2>/dev/null
+}
+
+show_cluster_logs() {
+    local cluster=$1
+    local job_id=$2
+    local follow=$3
+    local grep_pattern=$4
+    local err_mode=$5
+
+    echo "${BLUE}=== $cluster ===${NC}"
+
+    local ext="out"
+    [[ "$err_mode" == "true" ]] && ext="err"
+
+    local remote_path=""
+    if [[ -n "$job_id" ]]; then
+        if [[ "$cluster" == "mn" ]]; then
+            remote_path="$WORK_DIR/slurm-${job_id}.$ext"
+        else
+            # Try qf_ first, then slurm- (lbatch uses slurm- naming)
+            if ssh "$cluster" "test -f ~/$WORK_DIR/logs/qf_${job_id}.$ext" 2>/dev/null; then
+                remote_path="$WORK_DIR/logs/qf_${job_id}.$ext"
+            else
+                remote_path="$WORK_DIR/slurm-${job_id}.$ext"
+            fi
+        fi
+    else
+        remote_path=$(get_latest_log_path "$cluster" "$err_mode")
+        if [[ -z "$remote_path" ]]; then
+            echo "${YELLOW}No logs found${NC}"
+            echo ""
+            return
+        fi
+        remote_path="$WORK_DIR/$remote_path"
+    fi
+
+    if [[ "$follow" == "true" ]]; then
+        # Follow mode - must use ssh tail -f (can't copy a growing file)
+        echo "${YELLOW}Following: $remote_path${NC}"
+        ssh "$cluster" "tail -f ~/$remote_path" 2>/dev/null
+    else
+        # Copy locally then process
+        local local_path=$(copy_log_locally "$cluster" "$remote_path")
+
+        if [[ -z "$local_path" ]]; then
+            echo "${RED}Log not found: $remote_path${NC}"
+            echo ""
+            return
+        fi
+
+        echo "${GREEN}Log: $remote_path${NC}"
+        echo "---"
+
+        if [[ -n "$grep_pattern" ]]; then
+            grep --color=always -i "$grep_pattern" "$local_path" 2>/dev/null || echo "${YELLOW}No matches for '$grep_pattern'${NC}"
+        else
+            tail -100 "$local_path"
+        fi
+    fi
+    echo ""
+}
+
+list_logs() {
+    local cluster=$1
+    echo "${BLUE}=== $cluster logs ===${NC}"
+    ssh "$cluster" "
+        cd ~/$WORK_DIR 2>/dev/null || exit 1
+        # Show both qf_* and slurm-* logs, sorted by time
+        { ls -lth logs/qf_*.out 2>/dev/null; ls -lth slurm-*.out 2>/dev/null; } | head -15
+    " 2>/dev/null || echo "${RED}Could not connect to $cluster${NC}"
+    echo ""
+}
+
+# Parse arguments
+CLUSTER=""
+JOB_ID=""
+FOLLOW="false"
+LIST_ONLY="false"
+GREP_PATTERN=""
+ERR_MODE="false"
+PROJECT_ALIAS=""
+WAIT_SECS=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -p|--project)
+            PROJECT_ALIAS=$2
+            shift 2
+            ;;
+        -f|--follow)
+            FOLLOW="true"
+            shift
+            ;;
+        -l|--list)
+            LIST_ONLY="true"
+            shift
+            ;;
+        -g|--grep)
+            GREP_PATTERN=$2
+            shift 2
+            ;;
+        -e|--err|--error)
+            ERR_MODE="true"
+            shift
+            ;;
+        -w|--wait)
+            WAIT_SECS=$2
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: llogs [-p project] [bp|mn|is] [-f] [-l] [-e] [-w secs] [-g pattern] [job_id]"
+            echo "  -p, --project  Select project alias (see ~/.hpc_projects)"
+            echo "  -f, --follow   Follow log output (tail -f)"
+            echo "  -l, --list     List log files only"
+            echo "  -e, --error    Show error log (.err) instead of stdout"
+            echo "  -w, --wait     Wait N seconds before checking"
+            echo "  -g, --grep     Grep for pattern in log"
+            exit 0
+            ;;
+        bp|mn|is)
+            CLUSTER=$1
+            shift
+            ;;
+        [0-9]*)
+            JOB_ID=$1
+            shift
+            ;;
+        *)
+            echo "Usage: llogs [-p project] [bp|mn|is] [-f] [-l] [-e] [-w secs] [-g pattern] [job_id]"
+            echo "  -p, --project  Select project alias (see ~/.hpc_projects)"
+            echo "  -f, --follow   Follow log output (tail -f)"
+            echo "  -l, --list     List log files only"
+            echo "  -e, --error    Show error log (.err) instead of stdout"
+            echo "  -w, --wait     Wait N seconds before checking"
+            echo "  -g, --grep     Grep for pattern in log"
+            exit 1
+            ;;
+    esac
+done
+
+# Load project config
+source "$(dirname "$0")/../lib/_hpc_project_config"
+resolve_project "$PROJECT_ALIAS"
+
+# Wait if requested
+if [[ -n "$WAIT_SECS" ]]; then
+    echo "${YELLOW}Waiting ${WAIT_SECS}s...${NC}"
+    sleep "$WAIT_SECS"
+fi
+
+if [[ "$LIST_ONLY" == "true" ]]; then
+    if [[ -n "$CLUSTER" ]]; then
+        list_logs "$CLUSTER"
+    else
+        list_logs "bp"
+        list_logs "mn"
+        list_logs "is"
+    fi
+elif [[ -n "$CLUSTER" ]]; then
+    show_cluster_logs "$CLUSTER" "$JOB_ID" "$FOLLOW" "$GREP_PATTERN" "$ERR_MODE"
+else
+    # Show all clusters
+    show_cluster_logs "bp" "" "" "$GREP_PATTERN" "$ERR_MODE"
+    show_cluster_logs "mn" "" "" "$GREP_PATTERN" "$ERR_MODE"
+    show_cluster_logs "is" "" "" "$GREP_PATTERN" "$ERR_MODE"
+fi

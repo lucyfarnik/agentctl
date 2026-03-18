@@ -1,0 +1,7 @@
+# HPC project configuration
+# Format: alias:remote_work_dir:local_logs_dir
+# The first entry (or the one marked *) is the default
+# Lines starting with # are comments, blank lines are ignored
+
+*qf:work/qualitative_feedback:~/Library/Mobile Documents/com~apple~CloudDocs/Desktop/Research/Qualitative Feedback/logs
+aas:work/agentic_adapter_switching:~/Library/Mobile Documents/com~apple~CloudDocs/Desktop/Research/agentic_adapter_switching/logs
