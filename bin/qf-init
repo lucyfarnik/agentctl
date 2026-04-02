@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Initialize a new agentctl session. Prints agent-id and token.
+
+Usage:
+    qf-init                                    # new session
+    qf-init --name 'experiment monitor'        # new session with name
+    qf-init --id abc123 --token <token>        # verify existing session
+
+Pass the printed credentials to qf-submit/qf-cancel via --agent-id and --token flags.
+"""
+
+import argparse
+import json
+import os
+import sys
+import uuid
+from datetime import datetime
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib'))
+import agentctl
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Initialize a new agentctl session')
+    parser.add_argument('--name', help='Human-readable name for this agent session')
+    parser.add_argument('--id', help='Resume an existing session by ID')
+    parser.add_argument('--token', help='Auth token (required when resuming with --id)')
+    args = parser.parse_args()
+
+    if args.id:
+        if not args.token:
+            print("Error: --token is required when resuming a session.", file=sys.stderr)
+            sys.exit(1)
+        session_dir = os.path.join(agentctl.SESSIONS_DIR, args.id)
+        if not os.path.isdir(session_dir) or not agentctl.verify_agent_token(args.id, args.token):
+            print("Error: Invalid agent ID or token.", file=sys.stderr)
+            sys.exit(1)
+        print(f"agent-id: {args.id}")
+        print(f"token: {args.token}")
+        return
+
+    # Generate new 6-char hex ID and auth token
+    agent_id = uuid.uuid4().hex[:6]
+    token = agentctl.generate_token()
+    session_dir = os.path.join(agentctl.SESSIONS_DIR, agent_id)
+    os.makedirs(session_dir, exist_ok=True)
+
+    identity = {
+        'agent_id': agent_id,
+        'name': args.name or '',
+        'created_at': datetime.now().isoformat(),
+        'token_hash': agentctl.hash_token(token),
+    }
+    with open(os.path.join(session_dir, 'identity.json'), 'w') as f:
+        json.dump(identity, f, indent=2)
+
+    with open(os.path.join(session_dir, 'jobs.json'), 'w') as f:
+        json.dump([], f)
+
+    print(f"agent-id: {agent_id}")
+    print(f"token: {token}")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+sessions/*/
+!sessions/.gitkeep
+config/quotas.json

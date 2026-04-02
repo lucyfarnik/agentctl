@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Cancel an HPC job, with ownership verification.
+
+Usage:
+    qf-cancel --agent-id ID --token TOKEN <cluster> <job_id>
+
+Only cancels jobs that were submitted by the current agent.
+"""
+
+import subprocess
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib'))
+import agentctl
+
+
+def main():
+    agent_id, token, argv = agentctl.parse_agent_flags(sys.argv[1:])
+
+    if len(argv) != 2:
+        print("Usage: qf-cancel [--agent-id ID --token TOKEN] <cluster> <job_id>", file=sys.stderr)
+        sys.exit(1)
+
+    cluster = argv[0]
+    job_id = argv[1]
+
+    if cluster not in agentctl.CLUSTERS:
+        print(f"Error: Unknown cluster '{cluster}'. Use: {', '.join(sorted(agentctl.CLUSTERS))}", file=sys.stderr)
+        sys.exit(1)
+
+    if not job_id.isdigit():
+        print(f"Error: Invalid job ID '{job_id}'. Must be numeric.", file=sys.stderr)
+        sys.exit(1)
+
+    agent_id = agentctl.get_verified_agent(agent_id, token)
+
+    if not agentctl.is_agent_job(agent_id, job_id, cluster):
+        print(f"Error: Job {job_id} on {cluster} does not belong to agent {agent_id}.", file=sys.stderr)
+        print("You can only cancel jobs you submitted via qf-submit.", file=sys.stderr)
+        sys.exit(1)
+
+    # Cancel the job
+    result = subprocess.run(
+        ['ssh', cluster, f'scancel {job_id}'],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    if result.returncode != 0:
+        print(f"Error: scancel failed.", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[agentctl] Cancelled job {job_id} on {cluster} (agent {agent_id})")
+
+
+if __name__ == '__main__':
+    main()
