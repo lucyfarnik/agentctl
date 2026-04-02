@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Claude Code PreToolUse hook for Bash tool: blocks commands that reference
+agentctl protected directories (sessions/ and config/).
+
+This is a heuristic check — it looks for protected path strings in the command.
+Not airtight (an agent could obfuscate paths), but raises the bar significantly.
+"""
+
+import json
+import re
+import sys
+import os
+
+BYPASS_WARNING = """
+To bypass, include  export YES_I_KNOW_THIS_WILL_BE_SLOW=1  in your command. But
+consider the cost: a manual approval halts EVERY agent in the session — you and all
+subagents — until the user returns to their terminal, which is routinely 1-4+ hours.
+Even 20 auto-approved tool calls to build or extend a CLI will finish in under a
+minute and the result stays available for all future sessions. The bypass is almost
+never the faster path."""
+
+# Protected path patterns (expanded, for matching in command strings)
+AGENTCTL_ROOT = os.path.realpath(os.path.expanduser('~/CLIs/agentctl'))
+PROTECTED_DIRS = ['sessions', 'config']
+
+# Build patterns to match in command strings
+PROTECTED_PATTERNS = []
+for d in PROTECTED_DIRS:
+    full_path = os.path.join(AGENTCTL_ROOT, d)
+    # Match the full absolute path
+    PROTECTED_PATTERNS.append(re.escape(full_path))
+    # Match ~/CLIs/agentctl/{dir} (with tilde)
+    PROTECTED_PATTERNS.append(re.escape(f'~/CLIs/agentctl/{d}'))
+    # Match $HOME/CLIs/agentctl/{dir}
+    PROTECTED_PATTERNS.append(re.escape(f'$HOME/CLIs/agentctl/{d}'))
+    # Match ~/ with variable expansion
+    PROTECTED_PATTERNS.append(re.escape(os.path.expanduser(f'~/CLIs/agentctl/{d}')))
+
+# Case-insensitive combined pattern
+PATTERN = re.compile('|'.join(PROTECTED_PATTERNS), re.IGNORECASE)
+
+try:
+    data = json.load(sys.stdin)
+except (json.JSONDecodeError, EOFError):
+    sys.exit(0)
+
+tool_input = data.get('tool_input', {})
+command = tool_input.get('command', '')
+
+if not command:
+    sys.exit(0)
+
+# --- qf-admin requires manual approval every time ---
+if re.search(r'\bqf-admin\b', command):
+    if 'YES_I_KNOW_THIS_WILL_BE_SLOW=1' in command:
+        sys.exit(0)
+    print("BLOCKED: qf-admin requires manual approval.", file=sys.stderr)
+    print(BYPASS_WARNING, file=sys.stderr)
+    sys.exit(2)
+
+if PATTERN.search(command):
+    # Halt-aware bypass: if the command contains the bypass flag, let it through
+    # to normal permission check (which will require manual user approval).
+    if 'YES_I_KNOW_THIS_WILL_BE_SLOW=1' in command:
+        sys.exit(0)
+    print("BLOCKED: Bash command references a protected agentctl directory.", file=sys.stderr)
+    print("Direct access to agentctl sessions/ and config/ is not allowed.", file=sys.stderr)
+    print("Use the qf-* CLI tools (qf-init, qf-submit, qf-cancel) to manage agent sessions.", file=sys.stderr)
+    print(BYPASS_WARNING, file=sys.stderr)
+    sys.exit(2)
+
+# Catch path traversal: agentctl path containing /../ (e.g. "agentctl/bin/../config/")
+# Only match ".." as a path component (preceded or followed by /), not inside words like "..."
+if re.search(r'agentctl[^\s]*\.\.[/\s]', command, re.IGNORECASE) or \
+   re.search(r'agentctl[^\s]*/\.\.', command, re.IGNORECASE):
+    print(f"BLOCKED: Path traversal detected in agentctl path.", file=sys.stderr)
+    print("Commands referencing agentctl with '..' are not allowed.", file=sys.stderr)
+    sys.exit(2)
+
+# ---------------------------------------------------------------------------
+# Anti-obfuscation checks
+# ---------------------------------------------------------------------------
+# These catch common shell tricks that defeat the literal-string matching above.
+# All co-occurrence checks require "agentctl" somewhere in the command to avoid
+# false positives on innocent uses of words like "sessions" or "config".
+
+# Match "agentctl" only as a path component (e.g., /agentctl/, ~/agentctl),
+# NOT as part of env var names like AGENTCTL_AGENT_ID.
+has_agentctl_path = bool(re.search(r'(?<![A-Za-z_])agentctl(?![A-Za-z_])', command))
+
+# --- Check A: Co-occurrence of "agentctl" with protected dir names ----------
+# If "agentctl" (as a path component) and "sessions" or "config" both appear
+# anywhere in the command, block it.  This catches variable-expansion tricks
+# like:
+#   P=~/CLIs/agentctl; cat "$P/sessions/identity.json"
+# where the literal protected path is split across an assignment and a usage.
+# Legitimate commands like `grep session_timeout config.yaml` pass because
+# they won't also contain "agentctl" as a path component.
+# Also avoids false positives on AGENTCTL_AGENT_ID + --config flags.
+if has_agentctl_path:
+    for dirname in PROTECTED_DIRS:
+        if re.search(r'(?<![a-zA-Z])' + re.escape(dirname) + r'(?![a-zA-Z/._-])',
+                      command, re.IGNORECASE):
+            if 'YES_I_KNOW_THIS_WILL_BE_SLOW=1' in command:
+                sys.exit(0)
+            print(f"BLOCKED: Command contains both 'agentctl' and '{dirname}'.",
+                  file=sys.stderr)
+            print("This combination is blocked to prevent path-based protection bypasses.",
+                  file=sys.stderr)
+            print("Use the qf-* CLI tools to manage agent sessions.", file=sys.stderr)
+            print(BYPASS_WARNING, file=sys.stderr)
+            sys.exit(2)
+
+# --- Check B: Empty-quote insertion in path components ----------------------
+# Shells silently collapse '' and "" inside tokens, so agent''ctl == agentctl.
+# Detect quote-split variants of protected keywords:
+#   agent''ctl, agent""ctl, sess''ions, conf""ig
+QUOTE_SPLIT_PATTERNS = [
+    r"""agent['"]+'ctl""",          # agent''ctl  agent"ctl  etc.
+    r'''agent["]+ctl''',            # agent""ctl
+    r"""sess['"]+'ions""",          # sess''ions
+    r'''sess["]+ions''',            # sess""ions
+    r"""conf['"]+'ig""",            # conf''ig
+    r'''conf["]+ig''',              # conf""ig
+]
+for pat in QUOTE_SPLIT_PATTERNS:
+    if re.search(pat, command):
+        if 'YES_I_KNOW_THIS_WILL_BE_SLOW=1' in command:
+            sys.exit(0)
+        print("BLOCKED: Empty-quote insertion detected in path component.",
+              file=sys.stderr)
+        print("Inserting '' or \"\" to split path tokens is not allowed.",
+              file=sys.stderr)
+        print(BYPASS_WARNING, file=sys.stderr)
+        sys.exit(2)
+
+# --- Check C: Dynamic path construction ------------------------------------
+# Block commands that combine dynamic-execution / encoding tools (printf,
+# base64, xxd, eval) with any protected path fragment.  This catches:
+#   cat $(printf '%s/sessions' ~/CLIs/agentctl)/file
+#   eval "cat ~/CLIs/agentctl/sess" "ions/file"
+#   cat $(echo "..." | base64 -d)/file
+DYNAMIC_TOOLS = ['printf', 'base64', 'xxd', 'eval']
+PROTECTED_FRAGMENTS = ['agentctl', 'sessions', 'config']
+dynamic_tools_present = [t for t in DYNAMIC_TOOLS
+                         if re.search(r'\b' + re.escape(t) + r'\b', command)]
+if dynamic_tools_present:
+    found_fragments = [f for f in PROTECTED_FRAGMENTS
+                       if re.search(re.escape(f), command, re.IGNORECASE)]
+    if found_fragments:
+        if 'YES_I_KNOW_THIS_WILL_BE_SLOW=1' in command:
+            sys.exit(0)
+        print(f"BLOCKED: Dynamic command construction "
+              f"({', '.join(dynamic_tools_present)}) combined with protected "
+              f"path fragment(s): {', '.join(found_fragments)}.",
+              file=sys.stderr)
+        print("Constructing protected paths dynamically is not allowed.",
+              file=sys.stderr)
+        print(BYPASS_WARNING, file=sys.stderr)
+        sys.exit(2)
+
+# --- Check C2: Encoding tools used in command substitution ------------------
+# base64 -d / --decode and xxd -r (reverse) inside $(...) or backticks are
+# used to hide path content entirely.  The decoded payload is invisible to all
+# text-based checks, so we block the pattern outright: there is no legitimate
+# reason for a Claude Code agent to decode base64/hex into a file path.
+if re.search(r'base64\s+(-[dD]|--decode)', command) or \
+   re.search(r'xxd\s+-r\b', command):
+    if 'YES_I_KNOW_THIS_WILL_BE_SLOW=1' in command:
+        sys.exit(0)
+    print("BLOCKED: Encoding tool used in decode mode (base64 -d / xxd -r).",
+          file=sys.stderr)
+    print("Decoding opaque payloads into paths bypasses all text-based guards.",
+          file=sys.stderr)
+    print(BYPASS_WARNING, file=sys.stderr)
+    sys.exit(2)
+
+# --- Check D: Variable assignments containing protected fragments -----------
+# Catch patterns like:  P=~/CLIs/agentctl  or  DIR=/some/path/sessions
+# that store protected path components in shell variables for later use.
+# Only fires when "agentctl" also appears (to avoid false positives on
+# innocent assignments like SESSION_TIMEOUT=30).
+if has_agentctl_path:
+    for dirname in PROTECTED_DIRS:
+        # Match  =<non-whitespace>*dirname  (shell assignment syntax)
+        if re.search(r'=\S*' + re.escape(dirname), command, re.IGNORECASE):
+            if 'YES_I_KNOW_THIS_WILL_BE_SLOW=1' in command:
+                sys.exit(0)
+            print(f"BLOCKED: Variable assignment contains protected path "
+                  f"fragment '{dirname}'.", file=sys.stderr)
+            print("Storing protected paths in variables to bypass checks "
+                  "is not allowed.", file=sys.stderr)
+            print("Use the qf-* CLI tools to manage agent sessions.",
+                  file=sys.stderr)
+            print(BYPASS_WARNING, file=sys.stderr)
+            sys.exit(2)
+
+sys.exit(0)

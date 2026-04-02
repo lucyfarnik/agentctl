@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Claude Code PreToolUse hook: blocks direct Read/Edit/Write/Glob/Grep access
+to agentctl protected directories (sessions/ and config/). The qf-* CLIs access
+these internally as subprocesses, which bypass tool hooks.
+
+Hardened against:
+- Symlink bypass (uses realpath to resolve symlinks)
+- Case-insensitive macOS filesystem (lowercases both paths)
+- Glob/Grep tool access (checks pattern and path fields)
+"""
+
+import json
+import sys
+import os
+
+PROTECTED_PATHS = [
+    os.path.realpath(os.path.expanduser('~/CLIs/agentctl/sessions')),
+    os.path.realpath(os.path.expanduser('~/CLIs/agentctl/config')),
+]
+
+# Case-insensitive string fragments to catch in Glob patterns and Grep paths
+PROTECTED_FRAGMENTS = [
+    'agentctl/sessions',
+    'agentctl/config',
+]
+
+try:
+    data = json.load(sys.stdin)
+except (json.JSONDecodeError, EOFError):
+    sys.exit(0)
+
+tool_name = data.get('tool_name', '')
+tool_input = data.get('tool_input', {})
+
+
+def check_path(path_str, recursive_tool=False):
+    """Check if a path resolves to or contains a protected directory.
+
+    For recursive tools (Glob, Grep), also blocks ancestor paths that would
+    search into protected subdirectories.
+    """
+    if not path_str:
+        return False
+    resolved = os.path.realpath(os.path.expanduser(path_str))
+    for protected in PROTECTED_PATHS:
+        fp_lower = resolved.lower()
+        prot_lower = protected.lower()
+        # Path is inside or equal to a protected dir
+        if fp_lower.startswith(prot_lower + os.sep) or fp_lower == prot_lower:
+            return True
+        # For recursive tools: path is an ancestor of a protected dir
+        # (e.g. ~/CLIs/agentctl/ contains sessions/ and config/)
+        if recursive_tool and prot_lower.startswith(fp_lower + os.sep):
+            return True
+    return False
+
+
+def check_string_for_fragments(s):
+    """Check if a string contains references to protected directories."""
+    if not s:
+        return False
+    s_lower = s.lower()
+    return any(frag in s_lower for frag in PROTECTED_FRAGMENTS)
+
+
+def extract_glob_base_path(pattern):
+    """Extract the directory prefix before the first glob wildcard."""
+    # Find the first wildcard character
+    for i, c in enumerate(pattern):
+        if c in ('*', '?', '[', '{'):
+            # Return everything up to the last / before the wildcard
+            prefix = pattern[:i]
+            last_sep = prefix.rfind('/')
+            if last_sep >= 0:
+                return prefix[:last_sep + 1]
+            return ''
+    # No wildcards — the whole pattern is a path
+    return pattern
+
+
+# Collect all paths to check based on tool type
+paths_to_check = []
+strings_to_check = []
+
+is_recursive = tool_name in ('Glob', 'Grep')
+
+if tool_name in ('Read', 'Edit', 'Write'):
+    paths_to_check.append(tool_input.get('file_path', ''))
+    paths_to_check.append(tool_input.get('path', ''))
+elif tool_name == 'Glob':
+    # Glob has 'pattern' and optional 'path' fields
+    glob_pattern = tool_input.get('pattern', '')
+    strings_to_check.append(glob_pattern)
+    paths_to_check.append(tool_input.get('path', ''))
+    # Extract and check the base directory from the glob pattern
+    base_path = extract_glob_base_path(glob_pattern)
+    if base_path:
+        paths_to_check.append(base_path)
+elif tool_name == 'Grep':
+    # Grep has 'path' and optional 'glob' fields
+    paths_to_check.append(tool_input.get('path', ''))
+    strings_to_check.append(tool_input.get('glob', ''))
+else:
+    # Unknown tool, check common fields
+    paths_to_check.append(tool_input.get('file_path', ''))
+    paths_to_check.append(tool_input.get('path', ''))
+
+# Check resolved paths
+for p in paths_to_check:
+    if check_path(p, recursive_tool=is_recursive):
+        print(f"BLOCKED: Direct access to protected agentctl directory.", file=sys.stderr)
+        print("Use the qf-* CLI tools to manage agent sessions.", file=sys.stderr)
+        sys.exit(2)
+
+# Check string patterns (for Glob patterns that may contain protected paths)
+for s in strings_to_check:
+    if check_string_for_fragments(s):
+        print(f"BLOCKED: Pattern references a protected agentctl directory.", file=sys.stderr)
+        print("Use the qf-* CLI tools to manage agent sessions.", file=sys.stderr)
+        sys.exit(2)
+
+sys.exit(0)

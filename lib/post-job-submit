@@ -1,0 +1,25 @@
+#!/bin/bash
+# PostToolUse hook for Bash: after a job submission, nudge the agent to
+# set up a monitoring loop. Exit 2 sends stderr as context to Claude.
+
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command')
+
+# Only trigger on job submissions (hpc_utils/run or hpc_utils/sweep via SSH)
+if ! echo "$COMMAND" | grep -qE '(hpc_utils/run|hpc_utils/sweep)'; then
+  exit 0
+fi
+
+# Extract cluster name from the command
+CLUSTER=""
+if echo "$COMMAND" | grep -qE 'ssh\s+bp\b'; then CLUSTER="bp"
+elif echo "$COMMAND" | grep -qE 'ssh\s+mn\b'; then CLUSTER="mn"
+elif echo "$COMMAND" | grep -qE 'ssh\s+is\b'; then CLUSTER="is"
+fi
+
+echo "JOB SUBMITTED. Set up a monitoring loop to track this job." >&2
+echo "Use:  /loop 5m lq${CLUSTER:+ $CLUSTER}" >&2
+echo "This will check the queue every 5 minutes until you stop it." >&2
+echo "You can also use  llogs $CLUSTER <job_id>  to check output once it starts running." >&2
+
+exit 2

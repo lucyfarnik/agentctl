@@ -1,0 +1,95 @@
+#!/bin/bash
+# Global PreToolUse hook for Bash commands: enforces HPC workflow rules.
+# Exit 0 = allow (proceeds to normal permission check)
+# Exit 2 = block (message sent back to Claude)
+
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command')
+
+BYPASS_WARNING="
+To bypass, include  export YES_I_KNOW_THIS_WILL_BE_SLOW=1  in your command. But
+consider the cost: a manual approval halts EVERY agent in the session — you and all
+subagents — until the user returns to their terminal, which is routinely 1-4+ hours.
+Even 20 auto-approved tool calls to build or extend a CLI will finish in under a
+minute and the result stays available for all future sessions. The bypass is almost
+never the faster path."
+
+# Check for halt-aware bypass flag
+HAS_BYPASS=false
+if echo "$COMMAND" | grep -qF 'YES_I_KNOW_THIS_WILL_BE_SLOW=1'; then
+  HAS_BYPASS=true
+fi
+
+# Pre-approved read-only CLI tools
+READ_ONLY_CLIS="lq|llogs|lcplog|lnodes|ljob|lhist|lqa|lls|lcat|qfdata"
+
+# --- Rule 0: Block execution of cluster-specific hpc_utils scripts ---
+# hpc_utils/<cluster>/run exists locally but ./hpc_utils/copy syncs them to
+# a flat hpc_utils/ on the remote. Running locally or via the cluster-specific
+# path over SSH will fail.
+if echo "$COMMAND" | grep -qE 'hpc_utils/(bp|is|mn)/'; then
+  if echo "$COMMAND" | grep -qE '^(chmod|diff|ls|cat|head|tail|wc|file|stat|md5) '; then
+    :
+  else
+    echo "BLOCKED: Do not run cluster-specific hpc_utils scripts directly." >&2
+    echo "The ./hpc_utils/copy script syncs them to a flat hpc_utils/ directory on the remote." >&2
+    echo "To submit jobs: ./hpc_utils/copy -<flag>y && ssh <cluster> 'cd ~/work/qualitative_feedback && ./hpc_utils/run <args>'" >&2
+    exit 2
+  fi
+fi
+
+# --- Rule 1: Block chaining multiple read-only CLI calls ---
+CLI_COUNT=$(echo "$COMMAND" | grep -oE "(^|(;|&&|\|\||\||&) *)(${READ_ONLY_CLIS})" | wc -l | tr -d ' ')
+if [ "$CLI_COUNT" -gt 1 ]; then
+  echo "BLOCKED: Do not chain multiple read-only CLI calls in one command." >&2
+  echo "Use one CLI call per Bash tool invocation so each can be auto-approved." >&2
+  exit 2
+fi
+
+# --- Rule 2: Block raw SSH for read-only operations ---
+if echo "$COMMAND" | grep -qE 'ssh\s+["'"'"']?(bp|mn|is)["'"'"']?\s'; then
+  # Allow write operations (these need manual approval anyway)
+  if echo "$COMMAND" | grep -qE '(scancel|hpc_utils/run|hpc_utils/sweep|rm |mv |pip |conda |mkdir |hpc_utils/copy|sbatch)'; then
+    exit 0
+  fi
+  if [ "$HAS_BYPASS" = true ]; then exit 0; fi
+  echo "BLOCKED: Do not use raw SSH for read-only operations." >&2
+  echo "Use local CLI tools instead: lq, llogs, lnodes, ljob, lhist, lcplog, lqa, lls, lcat, qfdata." >&2
+  echo "" >&2
+  echo "The correct response is almost ALWAYS to modify an existing CLI or create a new one" >&2
+  echo "in ~/CLIs/agentctl/bin/. Do that instead. Do NOT bypass this rule just because it is" >&2
+  echo "faster — the CLI tools exist so that these operations can be auto-approved and so that" >&2
+  echo "the user gets consistent, well-formatted output." >&2
+  echo "$BYPASS_WARNING" >&2
+  exit 2
+fi
+
+# --- Rule 4: Block local execution of training/eval runners ---
+if echo "$COMMAND" | grep -qE 'python[23]? runners/(main|evaluate|grpo_baseline|synthetic_baseline)\.py'; then
+  echo "BLOCKED: Do not run training/eval runners locally — they require GPUs." >&2
+  echo "Submit to HPC: ./hpc_utils/copy -<flag>y && ssh <cluster> 'cd ~/work/qualitative_feedback && ./hpc_utils/run runners/<script> <args>'" >&2
+  exit 2
+fi
+
+# --- Rule 5: Block inline python for analysis ---
+if echo "$COMMAND" | grep -qE '(^|/)python[23]?(\.exe)? -(c|e) ' || echo "$COMMAND" | grep -qE '(^|/)python[23]?(\.exe)? *<<' || echo "$COMMAND" | grep -qE '\| *(\/[^ ]*\/)?python[23]?(\.exe)? *$'; then
+  if [ "$HAS_BYPASS" = true ]; then exit 0; fi
+  echo "BLOCKED: Do not use inline Python scripts for analysis." >&2
+  echo "Use local CLI tools (lqa, qfdata) or extend them. If no suitable CLI exists," >&2
+  echo "create a reusable one in ~/CLIs/agentctl/bin/." >&2
+  echo "$BYPASS_WARNING" >&2
+  exit 2
+fi
+
+# --- Rule 6: Block destructive git operations ---
+# These are hard to reverse and can destroy work. Let them through to manual
+# approval if the agent explicitly acknowledges the cost.
+if echo "$COMMAND" | grep -qE 'git (push\s+(-f|--force)|reset\s+--hard|clean\s+-f|checkout\s+\.\s*$|branch\s+-D)'; then
+  if [ "$HAS_BYPASS" = true ]; then exit 0; fi
+  echo "BLOCKED: Destructive git operation detected." >&2
+  echo "This command is hard to reverse and can destroy uncommitted or remote work." >&2
+  echo "$BYPASS_WARNING" >&2
+  exit 2
+fi
+
+exit 0
