@@ -20,9 +20,26 @@ import argparse
 import json
 import random
 import re
+import shlex
 import subprocess
 import sys
 import textwrap
+
+
+def validate_job_id(job_id):
+    """Validate that job_id contains only digits."""
+    if not job_id.isdigit():
+        print(f"Error: job_id must be numeric, got: {job_id}", file=sys.stderr)
+        sys.exit(1)
+    return job_id
+
+
+def validate_path_component(value, name="value"):
+    """Validate that a path component has no shell metacharacters."""
+    if not re.match(r'^[a-zA-Z0-9_./-]+$', value):
+        print(f"Error: {name} contains invalid characters: {value}", file=sys.stderr)
+        sys.exit(1)
+    return value
 
 
 def ssh_cmd(cluster, cmd, timeout=60):
@@ -35,6 +52,7 @@ def ssh_cmd(cluster, cmd, timeout=60):
 
 def find_run_sub_dir(cluster, job_id):
     """Find the run_sub_dir from the SLURM log."""
+    # job_id is already validated as numeric
     # Try slurm log first
     out, _ = ssh_cmd(cluster, f"grep -o 'run_sub_dir=.*job{job_id}' ~/work/qualitative_feedback/slurm-{job_id}.out 2>/dev/null | head -1")
     if out:
@@ -388,11 +406,15 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     args = parser.parse_args()
 
+    # Validate job_id is numeric to prevent command injection
+    validate_job_id(args.job_id)
+
     # Find run_sub_dir
     run_sub_dir = find_run_sub_dir(args.cluster, args.job_id)
     if not run_sub_dir:
         print(f"Could not find run_sub_dir for job {args.job_id} on {args.cluster}")
         sys.exit(1)
+    validate_path_component(run_sub_dir, "run_sub_dir")
     print(f"Run: {run_sub_dir}")
 
     if args.list:

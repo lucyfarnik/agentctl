@@ -9,7 +9,7 @@
 if [ $# -lt 1 ]; then
     echo "Usage: lls <cluster> [remote_path] [-g pattern]"
     echo "  cluster: bp, mn, is"
-    echo "  remote_path: path relative to ~/work/qualitative_feedback/ (default: .)"
+    echo "  remote_path: path relative to project work dir (default: .)"
     exit 1
 fi
 
@@ -21,10 +21,26 @@ if [ "$3" = "-g" ] && [ -n "$4" ]; then
     GREP_PATTERN="$4"
 fi
 
-FULL_PATH="~/work/qualitative_feedback/$REMOTE_PATH"
+# Load project config (auto-detect from pwd)
+source "$(dirname "$0")/../lib/_hpc_project_config"
+resolve_project ""
+
+FULL_PATH="~/$WORK_DIR/$REMOTE_PATH"
+
+# Validate path: only allow safe characters (allowlist approach)
+if ! echo "$REMOTE_PATH" | grep -qE '^[a-zA-Z0-9_./-]+$'; then
+    echo "Error: Remote path contains invalid characters." >&2
+    exit 1
+fi
+
+# Validate grep pattern: only allow safe characters
+if [ -n "$GREP_PATTERN" ] && ! echo "$GREP_PATTERN" | grep -qE '^[a-zA-Z0-9_. -]+$'; then
+    echo "Error: Grep pattern contains invalid characters." >&2
+    exit 1
+fi
 
 if [ -n "$GREP_PATTERN" ]; then
-    ssh "$CLUSTER" "ls $FULL_PATH | grep '$GREP_PATTERN'"
+    ssh "$CLUSTER" "ls ~/$WORK_DIR/$REMOTE_PATH | grep -F '$GREP_PATTERN'"
 else
-    ssh "$CLUSTER" "ls $FULL_PATH"
+    ssh "$CLUSTER" "ls ~/$WORK_DIR/$REMOTE_PATH"
 fi

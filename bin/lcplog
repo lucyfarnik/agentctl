@@ -44,6 +44,12 @@ resolve_project "$PROJECT_ALIAS"
 CLUSTER=$1
 JOB_ID=$2
 
+# Validate JOB_ID: must be numeric
+if [[ -n "$JOB_ID" && ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
+    echo "Error: Job ID must be numeric." >&2
+    exit 1
+fi
+
 # Ensure local logs directory exists
 mkdir -p "$LOCAL_LOGS"
 

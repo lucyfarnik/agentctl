@@ -51,6 +51,24 @@ if [[ -z "$CLUSTER" ]]; then
     exit 1
 fi
 
+# Validate JOB_ID: must be numeric
+if [[ -n "$JOB_ID" && ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
+    echo "Error: Job ID must be numeric." >&2
+    exit 1
+fi
+
+# Validate SINCE_DAYS: must be numeric
+if [[ ! "$SINCE_DAYS" =~ ^[0-9]+$ ]]; then
+    echo "Error: --since value must be numeric." >&2
+    exit 1
+fi
+
+# Validate NUM_JOBS: must be numeric
+if [[ ! "$NUM_JOBS" =~ ^[0-9]+$ ]]; then
+    echo "Error: --num value must be numeric." >&2
+    exit 1
+fi
+
 FMT="JobID,JobName%20,State,ExitCode,Elapsed,Start,End,NNodes,NCPUS,AllocTRES%40"
 
 if [[ -n "$JOB_ID" ]]; then

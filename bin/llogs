@@ -191,6 +191,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Validate JOB_ID: must be numeric
+if [[ -n "$JOB_ID" && ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
+    echo "Error: Job ID must be numeric." >&2
+    exit 1
+fi
+
 # Load project config
 source "$(dirname "$0")/../lib/_hpc_project_config"
 resolve_project "$PROJECT_ALIAS"

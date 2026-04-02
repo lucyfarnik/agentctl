@@ -9,7 +9,7 @@
 if [ $# -lt 2 ]; then
     echo "Usage: lcat <cluster> <remote_path> [--head N]"
     echo "  cluster: bp, mn, is"
-    echo "  remote_path: path relative to ~/work/qualitative_feedback/"
+    echo "  remote_path: path relative to project work dir"
     exit 1
 fi
 
@@ -21,10 +21,26 @@ if [ "$3" = "--head" ] && [ -n "$4" ]; then
     HEAD_N="$4"
 fi
 
-FULL_PATH="~/work/qualitative_feedback/$REMOTE_PATH"
+# Load project config (auto-detect from pwd)
+source "$(dirname "$0")/../lib/_hpc_project_config"
+resolve_project ""
+
+FULL_PATH="~/$WORK_DIR/$REMOTE_PATH"
+
+# Validate path: only allow safe characters (allowlist approach)
+if ! echo "$REMOTE_PATH" | grep -qE '^[a-zA-Z0-9_./-]+$'; then
+    echo "Error: Remote path contains invalid characters." >&2
+    exit 1
+fi
+
+# Validate HEAD_N is numeric
+if [ -n "$HEAD_N" ] && ! echo "$HEAD_N" | grep -qE '^[0-9]+$'; then
+    echo "Error: --head value must be a number." >&2
+    exit 1
+fi
 
 if [ -n "$HEAD_N" ]; then
-    ssh "$CLUSTER" "head -n $HEAD_N $FULL_PATH"
+    ssh "$CLUSTER" "head -n $HEAD_N ~/$WORK_DIR/$REMOTE_PATH"
 else
-    ssh "$CLUSTER" "cat $FULL_PATH"
+    ssh "$CLUSTER" "cat ~/$WORK_DIR/$REMOTE_PATH"
 fi

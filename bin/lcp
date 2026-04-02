@@ -2,7 +2,7 @@
 # Copy a file from a remote HPC cluster to a local directory
 # Usage: lcp <cluster> <remote_path> [local_path]
 #
-# remote_path: relative to ~/work/qualitative_feedback/
+# remote_path: relative to project work dir
 # local_path:  optional, defaults to /tmp/<basename>
 #
 # Examples:
@@ -12,7 +12,7 @@
 if [ $# -lt 2 ]; then
     echo "Usage: lcp <cluster> <remote_path> [local_path]"
     echo "  cluster: bp, mn, is"
-    echo "  remote_path: path relative to ~/work/qualitative_feedback/"
+    echo "  remote_path: path relative to project work dir"
     echo "  local_path:  optional, defaults to /tmp/<basename>"
     exit 1
 fi
@@ -21,7 +21,17 @@ CLUSTER="$1"
 REMOTE_PATH="$2"
 LOCAL_PATH="${3:-/tmp/$(basename "$REMOTE_PATH")}"
 
-FULL_REMOTE="~/work/qualitative_feedback/$REMOTE_PATH"
+# Validate REMOTE_PATH: only allow safe characters
+if echo "$REMOTE_PATH" | grep -qvE '^[a-zA-Z0-9_./-]+$'; then
+    echo "Error: Remote path contains invalid characters." >&2
+    exit 1
+fi
+
+# Load project config (auto-detect from pwd)
+source "$(dirname "$0")/../lib/_hpc_project_config"
+resolve_project ""
+
+FULL_REMOTE="~/$WORK_DIR/$REMOTE_PATH"
 
 echo "Copying $CLUSTER:$FULL_REMOTE -> $LOCAL_PATH"
 scp "$CLUSTER:$FULL_REMOTE" "$LOCAL_PATH" 2>/dev/null

@@ -55,6 +55,18 @@ if [[ -z "$CLUSTER" ]]; then
     exit 1
 fi
 
+# Validate JOB_ID: must be numeric
+if [[ -n "$JOB_ID" && ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
+    echo "Error: Job ID must be numeric." >&2
+    exit 1
+fi
+
+# Validate NODE: only allow alphanumeric, hyphens, underscores
+if [[ -n "$NODE" && ! "$NODE" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Error: Node name contains invalid characters (only alphanumeric, hyphens, underscores allowed)." >&2
+    exit 1
+fi
+
 FMT='%i %u %P %j %T %M %l %D %C %b %R'
 
 if [[ -n "$JOB_ID" && "$VERBOSE" == "true" ]]; then

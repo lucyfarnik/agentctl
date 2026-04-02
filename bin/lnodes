@@ -34,6 +34,12 @@ if [[ -z "$CLUSTER" ]]; then
     exit 1
 fi
 
+# Validate node filter: only allow alphanumeric, hyphens, underscores
+if [[ -n "$NODE_FILTER" && ! "$NODE_FILTER" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Error: Node filter contains invalid characters (only alphanumeric, hyphens, underscores allowed)." >&2
+    exit 1
+fi
+
 show_nodes() {
     local cluster=$1
     local filter=$2
