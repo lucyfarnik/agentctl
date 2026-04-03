@@ -50,11 +50,11 @@ command = tool_input.get('command', '')
 if not command:
     sys.exit(0)
 
-# --- qf-admin requires manual approval every time ---
-if re.search(r'\bqf-admin\b', command):
+# --- ladmin requires manual approval every time ---
+if re.search(r'\bladmin\b', command):
     if 'YES_I_KNOW_THIS_WILL_BE_SLOW=1' in command:
         sys.exit(0)
-    print("BLOCKED: qf-admin requires manual approval.", file=sys.stderr)
+    print("BLOCKED: ladmin requires manual approval.", file=sys.stderr)
     print(BYPASS_WARNING, file=sys.stderr)
     sys.exit(2)
 
@@ -65,7 +65,7 @@ if PATTERN.search(command):
         sys.exit(0)
     print("BLOCKED: Bash command references a protected agentctl directory.", file=sys.stderr)
     print("Direct access to agentctl sessions/ and config/ is not allowed.", file=sys.stderr)
-    print("Use the qf-* CLI tools (qf-init, qf-submit, qf-cancel) to manage agent sessions.", file=sys.stderr)
+    print("Use the agentctl CLI tools (linit, lsubmit, lcancel) to manage agent sessions.", file=sys.stderr)
     print(BYPASS_WARNING, file=sys.stderr)
     sys.exit(2)
 
@@ -107,7 +107,7 @@ if has_agentctl_path:
                   file=sys.stderr)
             print("This combination is blocked to prevent path-based protection bypasses.",
                   file=sys.stderr)
-            print("Use the qf-* CLI tools to manage agent sessions.", file=sys.stderr)
+            print("Use the agentctl CLI tools to manage agent sessions.", file=sys.stderr)
             print(BYPASS_WARNING, file=sys.stderr)
             sys.exit(2)
 
@@ -190,7 +190,7 @@ if has_agentctl_path:
                   f"fragment '{dirname}'.", file=sys.stderr)
             print("Storing protected paths in variables to bypass checks "
                   "is not allowed.", file=sys.stderr)
-            print("Use the qf-* CLI tools to manage agent sessions.",
+            print("Use the agentctl CLI tools to manage agent sessions.",
                   file=sys.stderr)
             print(BYPASS_WARNING, file=sys.stderr)
             sys.exit(2)

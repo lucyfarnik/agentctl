@@ -107,9 +107,15 @@ def parse_agent_flags(argv):
         if argv[i] == '--agent-id' and i + 1 < len(argv):
             agent_id = argv[i + 1]
             i += 2
+        elif argv[i].startswith('--agent-id='):
+            agent_id = argv[i].split('=', 1)[1]
+            i += 1
         elif argv[i] == '--token' and i + 1 < len(argv):
             token = argv[i + 1]
             i += 2
+        elif argv[i].startswith('--token='):
+            token = argv[i].split('=', 1)[1]
+            i += 1
         else:
             remaining.append(argv[i])
             i += 1
@@ -359,3 +365,65 @@ def find_project_root():
             break
         path = parent
     return None
+
+
+def resolve_project(project_root=None):
+    """Resolve the current project to its remote work directory.
+
+    Reads config/.hpc_projects and matches against project_root (or cwd).
+    Returns (alias, remote_work_dir) or (None, None) if not found.
+
+    .hpc_projects format:
+        alias:remote_work_dir:local_logs_dir
+        *default_alias:remote_work_dir:local_logs_dir
+    """
+    config_file = os.path.join(CONFIG_DIR, '.hpc_projects')
+    if not os.path.exists(config_file):
+        return None, None
+
+    if not project_root:
+        project_root = find_project_root() or os.getcwd()
+    project_root = os.path.realpath(project_root)
+
+    entries = []
+    default_entry = None
+    with open(config_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            is_default = line.startswith('*')
+            if is_default:
+                line = line[1:]
+            parts = line.split(':', 2)
+            if len(parts) < 2:
+                continue
+            alias = parts[0]
+            remote_work_dir = parts[1].rstrip('/')
+            # Validate remote_work_dir — it goes into SSH commands
+            if not re.match(r'^[a-zA-Z0-9_./-]+$', remote_work_dir):
+                continue  # skip malformed entries
+            local_path = os.path.expanduser(parts[2]) if len(parts) > 2 else ''
+            entry = (alias, remote_work_dir, local_path)
+            entries.append(entry)
+            if is_default:
+                default_entry = entry
+
+    # Try matching project_root against local paths
+    for alias, remote_work_dir, local_path in entries:
+        if not local_path:
+            continue
+        # The local_path in config is the logs dir; project root is its parent
+        local_project = os.path.realpath(local_path.rstrip('/').rsplit('/logs', 1)[0])
+        if project_root == local_project or project_root.startswith(local_project + os.sep):
+            return alias, remote_work_dir
+
+    # Fall back to default
+    if default_entry:
+        return default_entry[0], default_entry[1]
+
+    # Fall back to first entry
+    if entries:
+        return entries[0][0], entries[0][1]
+
+    return None, None

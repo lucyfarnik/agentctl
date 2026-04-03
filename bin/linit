@@ -2,11 +2,11 @@
 """Initialize a new agentctl session. Prints agent-id and token.
 
 Usage:
-    qf-init                                    # new session
-    qf-init --name 'experiment monitor'        # new session with name
-    qf-init --id abc123 --token <token>        # verify existing session
+    linit                                    # new session
+    linit --name 'experiment monitor'        # new session with name
+    linit --id abc123 --token <token>        # verify existing session
 
-Pass the printed credentials to qf-submit/qf-cancel via --agent-id and --token flags.
+Pass the printed credentials to lsubmit/lcancel via --agent-id and --token flags.
 """
 
 import argparse

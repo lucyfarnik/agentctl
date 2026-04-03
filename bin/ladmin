@@ -4,11 +4,11 @@
 Not token-gated — meant for the human user, not agents.
 
 Usage:
-    qf-admin quota set <agent_id> <cluster> <limit>
-    qf-admin quota get <agent_id> <cluster>
-    qf-admin quota list
-    qf-admin sessions list
-    qf-admin sessions delete <agent_id>
+    ladmin quota set <agent_id> <cluster> <limit>
+    ladmin quota get <agent_id> <cluster>
+    ladmin quota list
+    ladmin sessions list
+    ladmin sessions delete <agent_id>
 """
 
 import json
@@ -37,7 +37,7 @@ def save_quotas(quotas):
 
 def cmd_quota_set(args):
     if len(args) != 3:
-        print("Usage: qf-admin quota set <agent_id> <cluster> <limit>", file=sys.stderr)
+        print("Usage: ladmin quota set <agent_id> <cluster> <limit>", file=sys.stderr)
         sys.exit(1)
     agent_id, cluster, limit = args
     if cluster not in agentctl.CLUSTERS:
@@ -58,7 +58,7 @@ def cmd_quota_set(args):
 
 def cmd_quota_get(args):
     if len(args) != 2:
-        print("Usage: qf-admin quota get <agent_id> <cluster>", file=sys.stderr)
+        print("Usage: ladmin quota get <agent_id> <cluster>", file=sys.stderr)
         sys.exit(1)
     agent_id, cluster = args
     quota = agentctl.get_quota(agent_id, cluster)
@@ -101,7 +101,7 @@ def cmd_sessions_list(args):
 
 def cmd_sessions_delete(args):
     if len(args) != 1:
-        print("Usage: qf-admin sessions delete <agent_id>", file=sys.stderr)
+        print("Usage: ladmin sessions delete <agent_id>", file=sys.stderr)
         sys.exit(1)
     agent_id = args[0]
     session_dir = os.path.join(agentctl.SESSIONS_DIR, agent_id)
@@ -129,7 +129,7 @@ def main():
         elif subcmd == 'list':
             cmd_quota_list(rest)
         else:
-            print("Usage: qf-admin quota [set|get|list]", file=sys.stderr)
+            print("Usage: ladmin quota [set|get|list]", file=sys.stderr)
             sys.exit(1)
     elif cmd == 'sessions':
         if subcmd == 'list':
@@ -137,7 +137,7 @@ def main():
         elif subcmd == 'delete':
             cmd_sessions_delete(rest)
         else:
-            print("Usage: qf-admin sessions [list|delete]", file=sys.stderr)
+            print("Usage: ladmin sessions [list|delete]", file=sys.stderr)
             sys.exit(1)
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Claude Code PreToolUse hook: blocks direct Read/Edit/Write/Glob/Grep access
-to agentctl protected directories (sessions/ and config/). The qf-* CLIs access
+to agentctl protected directories (sessions/ and config/). The agentctl CLI tools access
 these internally as subprocesses, which bypass tool hooks.
 
 Hardened against:
@@ -16,6 +16,11 @@ import os
 PROTECTED_PATHS = [
     os.path.realpath(os.path.expanduser('~/CLIs/agentctl/sessions')),
     os.path.realpath(os.path.expanduser('~/CLIs/agentctl/config')),
+]
+
+# Paths within protected dirs that are explicitly allowed
+ALLOWED_PATHS = [
+    os.path.realpath(os.path.expanduser('~/CLIs/agentctl/config/.hpc_projects')),
 ]
 
 # Case-insensitive string fragments to catch in Glob patterns and Grep paths
@@ -42,6 +47,10 @@ def check_path(path_str, recursive_tool=False):
     if not path_str:
         return False
     resolved = os.path.realpath(os.path.expanduser(path_str))
+    # Check allowlist first
+    for allowed in ALLOWED_PATHS:
+        if resolved.lower() == allowed.lower():
+            return False
     for protected in PROTECTED_PATHS:
         fp_lower = resolved.lower()
         prot_lower = protected.lower()
@@ -109,14 +118,14 @@ else:
 for p in paths_to_check:
     if check_path(p, recursive_tool=is_recursive):
         print(f"BLOCKED: Direct access to protected agentctl directory.", file=sys.stderr)
-        print("Use the qf-* CLI tools to manage agent sessions.", file=sys.stderr)
+        print("Use the agentctl CLI tools to manage agent sessions.", file=sys.stderr)
         sys.exit(2)
 
 # Check string patterns (for Glob patterns that may contain protected paths)
 for s in strings_to_check:
     if check_string_for_fragments(s):
         print(f"BLOCKED: Pattern references a protected agentctl directory.", file=sys.stderr)
-        print("Use the qf-* CLI tools to manage agent sessions.", file=sys.stderr)
+        print("Use the agentctl CLI tools to manage agent sessions.", file=sys.stderr)
         sys.exit(2)
 
 sys.exit(0)

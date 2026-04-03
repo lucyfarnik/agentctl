@@ -16,8 +16,11 @@ Use lwandb (without -delete) to browse first.
 """
 
 import argparse
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib'))
 from datetime import datetime, timezone
 
 import wandb
@@ -317,7 +320,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--project", "-p", default="qualitative_feedback", help="W&B project name")
+    parser.add_argument("--project", "-p", default=None, help="W&B project name (auto-detected from cwd if not set)")
     parser.add_argument("--entity", "-e", default=None, help="W&B entity (team/user)")
 
     sub = parser.add_subparsers(dest="command")
@@ -341,6 +344,15 @@ def main():
     p_art.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
 
     args = parser.parse_args()
+
+    # Auto-detect project from cwd if not specified
+    if not args.project:
+        try:
+            import agentctl
+            _, remote_dir = agentctl.resolve_project()
+            args.project = remote_dir.rstrip('/').split('/')[-1] if remote_dir else "qualitative_feedback"
+        except Exception:
+            args.project = "qualitative_feedback"
 
     if args.command is None:
         parser.print_help()

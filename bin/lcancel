@@ -2,7 +2,7 @@
 """Cancel an HPC job, with ownership verification.
 
 Usage:
-    qf-cancel --agent-id ID --token TOKEN <cluster> <job_id>
+    lcancel --agent-id ID --token TOKEN <cluster> <job_id>
 
 Only cancels jobs that were submitted by the current agent.
 """
@@ -19,7 +19,7 @@ def main():
     agent_id, token, argv = agentctl.parse_agent_flags(sys.argv[1:])
 
     if len(argv) != 2:
-        print("Usage: qf-cancel [--agent-id ID --token TOKEN] <cluster> <job_id>", file=sys.stderr)
+        print("Usage: lcancel [--agent-id ID --token TOKEN] <cluster> <job_id>", file=sys.stderr)
         sys.exit(1)
 
     cluster = argv[0]
@@ -37,7 +37,7 @@ def main():
 
     if not agentctl.is_agent_job(agent_id, job_id, cluster):
         print(f"Error: Job {job_id} on {cluster} does not belong to agent {agent_id}.", file=sys.stderr)
-        print("You can only cancel jobs you submitted via qf-submit.", file=sys.stderr)
+        print("You can only cancel jobs you submitted via lsubmit.", file=sys.stderr)
         sys.exit(1)
 
     # Cancel the job

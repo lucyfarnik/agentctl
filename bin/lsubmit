@@ -2,11 +2,11 @@
 """Submit an HPC job with agent ownership tracking and quota enforcement.
 
 Usage:
-    qf-submit --agent-id ID --token TOKEN <cluster> <runner> [runner_args...]
-    qf-submit --agent-id ab12cd --token <tok> bp runners/main.py --80g
+    lsubmit --agent-id ID --token TOKEN <cluster> <runner> [runner_args...]
+    lsubmit --agent-id ab12cd --token <tok> bp runners/main.py --80g
 
 Authenticate with --agent-id/--token flags (or AGENTCTL_AGENT_ID/AGENTCTL_TOKEN env vars).
-Run qf-init to create a session and get your credentials.
+Run linit to create a session and get your credentials.
 """
 
 import os
@@ -22,8 +22,8 @@ def main():
     agent_id, token, argv = agentctl.parse_agent_flags(sys.argv[1:])
 
     if len(argv) < 2:
-        print("Usage: qf-submit [--agent-id ID --token TOKEN] <cluster> <runner> [args...]", file=sys.stderr)
-        print("  e.g. qf-submit --agent-id ab12cd --token <tok> bp runners/main.py --80g", file=sys.stderr)
+        print("Usage: lsubmit [--agent-id ID --token TOKEN] <cluster> <runner> [args...]", file=sys.stderr)
+        print("  e.g. lsubmit --agent-id ab12cd --token <tok> bp runners/main.py --80g", file=sys.stderr)
         sys.exit(1)
 
     cluster = argv[0]
@@ -41,7 +41,7 @@ def main():
     if quota == 0:
         print(f"Error: Agent {agent_id} has no quota on {cluster} (quota=0).", file=sys.stderr)
         print("Request a quota (requires manual approval, may take hours):", file=sys.stderr)
-        print(f"  export YES_I_KNOW_THIS_WILL_BE_SLOW=1 && qf-admin quota set {agent_id} {cluster} <number>", file=sys.stderr)
+        print(f"  export YES_I_KNOW_THIS_WILL_BE_SLOW=1 && ladmin quota set {agent_id} {cluster} <number>", file=sys.stderr)
         sys.exit(1)
 
     active = agentctl.count_active_agent_jobs(agent_id, cluster)
@@ -52,12 +52,21 @@ def main():
 
     print(f"[agentctl] Agent {agent_id}: {active}/{quota} active jobs on {cluster}")
 
-    # --- Find project root ---
+    # --- Find project root and resolve remote path ---
     project_root = agentctl.find_project_root()
     if not project_root:
         print("Error: Could not find project root (no hpc_utils/copy found).", file=sys.stderr)
         print("Run from within the project directory.", file=sys.stderr)
         sys.exit(1)
+
+    project_alias, remote_work_dir = agentctl.resolve_project(project_root)
+    if not remote_work_dir:
+        print("Error: Project not found in config/.hpc_projects.", file=sys.stderr)
+        print("Add your project to ~/CLIs/agentctl/config/.hpc_projects first.", file=sys.stderr)
+        print("Format: alias:remote_work_dir:local_logs_dir", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[agentctl] Project: {project_alias} (~/{remote_work_dir})")
 
     # === PHASE 1: Reserve quota slot ===
     args_str = ' '.join(shlex.quote(a) for a in [runner] + runner_args)
@@ -90,7 +99,7 @@ def main():
             sys.exit(1)
 
         # --- Submit job ---
-        remote_cmd = f"cd ~/work/qualitative_feedback && ./hpc_utils/run {args_str}"
+        remote_cmd = f"cd ~/{remote_work_dir} && ./hpc_utils/run {args_str}"
         print(f"[agentctl] Submitting: {args_str}")
         maybe_submitted = True  # SSH is about to run — job may exist after this point
         try:

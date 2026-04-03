@@ -393,7 +393,7 @@ def show_pairs(pairs, indices, full_index=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Qualitative analysis of DPO pairs")
+    parser = argparse.ArgumentParser(description="Qualitative analysis of DPO pairs (qualitative_feedback project only)")
     parser.add_argument("cluster", help="Cluster: bp, mn, is")
     parser.add_argument("job_id", help="SLURM job ID")
     parser.add_argument("--epoch", type=int, default=0, help="Epoch number (default: 0)")
@@ -405,6 +405,9 @@ def main():
     parser.add_argument("--compare-epochs", action="store_true", help="Compare summary stats across all epochs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     args = parser.parse_args()
+
+    # This tool is specific to the qualitative_feedback project
+    print("Note: lqa is specific to the qualitative_feedback project.", file=sys.stderr)
 
     # Validate job_id is numeric to prevent command injection
     validate_job_id(args.job_id)

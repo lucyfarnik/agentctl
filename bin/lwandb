@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Browse Weights & Biases storage for the qualitative_feedback project (read-only).
+"""Browse Weights & Biases storage (read-only). Auto-detects project from cwd.
 
 Usage:
   lwandb                        # Summary: runs grouped by status, total storage
@@ -11,13 +11,16 @@ Usage:
   lwandb artifacts --type dataset  # Filter by artifact type
   lwandb big                    # Show biggest storage consumers (tables + artifacts)
   lwandb big -n 5               # Top 5 runs by size with file breakdown
-  lwandb project [name]         # Use a different project (default: qualitative_feedback)
+  lwandb --project NAME          # Use a specific project (auto-detected from cwd if not set)
 
 See also: lwandb-delete (separate tool for destructive operations)
 """
 
 import argparse
+import os
 import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'lib'))
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -303,7 +306,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--project", "-p", default="qualitative_feedback", help="W&B project name")
+    parser.add_argument("--project", "-p", default=None, help="W&B project name (auto-detected from cwd if not set)")
     parser.add_argument("--entity", "-e", default=None, help="W&B entity (team/user)")
 
     sub = parser.add_subparsers(dest="command")
@@ -326,6 +329,15 @@ def main():
     p_art.add_argument("--type", "-t", help="Filter by artifact type")
 
     args = parser.parse_args()
+
+    # Auto-detect project from cwd if not specified
+    if not args.project:
+        try:
+            import agentctl
+            _, remote_dir = agentctl.resolve_project()
+            args.project = remote_dir.rstrip('/').split('/')[-1] if remote_dir else "qualitative_feedback"
+        except Exception:
+            args.project = "qualitative_feedback"
 
     if args.command is None or args.command == "summary":
         cmd_summary(args)

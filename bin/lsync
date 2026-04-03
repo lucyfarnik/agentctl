@@ -2,7 +2,7 @@
 """Sync project code to a cluster without submitting a job.
 
 Usage:
-    qf-sync <cluster>
+    lsync <cluster>
 """
 
 import os
@@ -15,7 +15,7 @@ import agentctl
 
 def main():
     if len(sys.argv) != 2:
-        print("Usage: qf-sync <cluster>", file=sys.stderr)
+        print("Usage: lsync <cluster>", file=sys.stderr)
         sys.exit(1)
 
     cluster = sys.argv[1]

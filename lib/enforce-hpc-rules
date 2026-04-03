@@ -33,7 +33,7 @@ if echo "$COMMAND" | grep -qE 'hpc_utils/(bp|is|mn)/'; then
   else
     echo "BLOCKED: Do not run cluster-specific hpc_utils scripts directly." >&2
     echo "The ./hpc_utils/copy script syncs them to a flat hpc_utils/ directory on the remote." >&2
-    echo "To submit jobs: ./hpc_utils/copy -<flag>y && ssh <cluster> 'cd ~/work/qualitative_feedback && ./hpc_utils/run <args>'" >&2
+    echo "To submit jobs, use: lsubmit --agent-id <id> --token <tok> <cluster> <runner> [args...]" >&2
     exit 2
   fi
 fi
@@ -67,7 +67,7 @@ fi
 # --- Rule 4: Block local execution of training/eval runners ---
 if echo "$COMMAND" | grep -qE 'python[23]? runners/(main|evaluate|grpo_baseline|synthetic_baseline)\.py'; then
   echo "BLOCKED: Do not run training/eval runners locally — they require GPUs." >&2
-  echo "Submit to HPC: ./hpc_utils/copy -<flag>y && ssh <cluster> 'cd ~/work/qualitative_feedback && ./hpc_utils/run runners/<script> <args>'" >&2
+  echo "Submit to HPC: lsubmit --agent-id <id> --token <tok> <cluster> <runner> [args...]" >&2
   exit 2
 fi
 
