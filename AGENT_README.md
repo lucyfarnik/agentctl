@@ -244,6 +244,7 @@ You've hit your concurrent job limit. Options:
 | `ltransfers` | Check active transfers | No |
 | `lqa` | DPO pair analysis (remote) | No |
 | `qfdata` | DPO pair analysis (local) | No |
+| `lnpz` | Inspect/compare .npz files | No |
 | `lwandb` | Browse W&B storage | No |
 | `lwandb-delete` | Delete W&B runs/artifacts | No |
 | `lhelp` | Show this guide | No |

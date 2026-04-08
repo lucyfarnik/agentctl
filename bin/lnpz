@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Inspect and compare .npz files (saved numpy arrays).
+
+Usage:
+    lnpz <file1> [file2 ...] [--key KEY] [--diff] [--stats] [--hist]
+
+Examples:
+    lnpz /tmp/scores.npz                          # list keys and shapes
+    lnpz /tmp/a.npz /tmp/b.npz --diff             # compare two files, show N differing elements
+    lnpz /tmp/a.npz --key verbal_scores --stats   # stats for a specific array
+    lnpz /tmp/a.npz /tmp/b.npz --key scores --diff  # diff on a specific key
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+
+
+def describe(name: str, arr: np.ndarray) -> None:
+    print(f"  {name}: shape={arr.shape} dtype={arr.dtype}")
+    if arr.dtype.kind in "fiu" and arr.size > 0:
+        print(f"    min={arr.min():.6g}  max={arr.max():.6g}  mean={arr.mean():.6g}  std={arr.std():.6g}")
+        uniq = np.unique(arr)
+        if uniq.size <= 10:
+            print(f"    unique ({uniq.size}): {uniq}")
+        else:
+            print(f"    unique count: {uniq.size}")
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Inspect and compare .npz files")
+    p.add_argument("files", nargs="+", help="One or more .npz file paths")
+    p.add_argument("--key", "-k", help="Only operate on this key (default: all keys)")
+    p.add_argument("--diff", action="store_true", help="Compare arrays across files")
+    p.add_argument("--stats", action="store_true", help="Show stats for each array")
+    p.add_argument("--hist", action="store_true", help="Show value histogram (top 10 bins)")
+    args = p.parse_args()
+
+    loaded = []
+    for f in args.files:
+        path = Path(f)
+        if not path.exists():
+            print(f"ERROR: {f} does not exist", file=sys.stderr)
+            return 1
+        loaded.append((path, np.load(path)))
+
+    # Find keys to inspect
+    all_keys = set()
+    for _, data in loaded:
+        all_keys.update(data.files)
+    if args.key:
+        if args.key not in all_keys:
+            print(f"ERROR: key '{args.key}' not found. Available: {sorted(all_keys)}", file=sys.stderr)
+            return 1
+        keys = [args.key]
+    else:
+        keys = sorted(all_keys)
+
+    # Single file mode: describe
+    if len(loaded) == 1:
+        path, data = loaded[0]
+        print(f"File: {path}")
+        for key in keys:
+            if key in data.files:
+                arr = data[key]
+                describe(key, arr)
+                if args.hist and arr.dtype.kind in "fiu":
+                    uniq, counts = np.unique(arr, return_counts=True)
+                    order = np.argsort(-counts)[:10]
+                    print(f"    top values:")
+                    for i in order:
+                        print(f"      {uniq[i]!r}: {counts[i]}")
+        return 0
+
+    # Multi-file: describe each then diff if requested
+    for path, data in loaded:
+        print(f"\nFile: {path}")
+        for key in keys:
+            if key in data.files:
+                describe(key, data[key])
+
+    if args.diff:
+        print("\n=== Pairwise comparison ===")
+        for key in keys:
+            arrs = [(path, data[key]) for path, data in loaded if key in data.files]
+            if len(arrs) < 2:
+                continue
+            print(f"\nKey: {key}")
+            ref_path, ref = arrs[0]
+            for other_path, other in arrs[1:]:
+                if ref.shape != other.shape:
+                    print(f"  {other_path.name}: SHAPE MISMATCH ({ref.shape} vs {other.shape})")
+                    continue
+                equal = np.array_equal(ref, other)
+                if equal:
+                    print(f"  {other_path.name} == {ref_path.name}: IDENTICAL")
+                else:
+                    n_diff = int(np.sum(ref != other))
+                    max_abs_diff = float(np.max(np.abs(ref.astype(np.float64) - other.astype(np.float64))))
+                    print(f"  {other_path.name} vs {ref_path.name}: {n_diff}/{ref.size} differ, max |diff|={max_abs_diff:.6g}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
